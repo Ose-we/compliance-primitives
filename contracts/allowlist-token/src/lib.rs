@@ -517,19 +517,22 @@ impl AllowlistToken {
 
     /// Remove `address` from the allowlist. Admin or compliance officer.
     ///
+    /// If `address` is not allowlisted this is a silent no-op: no storage
+    /// write happens and no `AllowRemove` event is emitted, so event streams
+    /// only ever record real state changes.
+    ///
     /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Allowed(address.clone()));
-        AllowRemove { address }.publish(&env);
+        Self::remove_allowed_if_present(&env, address);
         Ok(())
     }
 
     /// Remove every address from the allowlist. Admin or compliance officer;
-    /// each address emits an individual `AllowRemove` event.
+    /// each address that was actually allowlisted emits an individual
+    /// `AllowRemove` event. Addresses that are not allowlisted are skipped
+    /// with no write and no event, matching `remove_from_allowlist`.
     ///
     /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn remove_multiple_from_allowlist(
@@ -544,10 +547,7 @@ impl AllowlistToken {
         }
 
         for address in addresses.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Allowed(address.clone()));
-            AllowRemove { address }.publish(&env);
+            Self::remove_allowed_if_present(&env, address);
         }
         Ok(())
     }
@@ -1046,6 +1046,16 @@ impl AllowlistToken {
             );
         }
         Err(Error::NotAuthorized)
+    }
+
+    /// Removes the allowlist entry for `address` and emits `AllowRemove`, but
+    /// only if an entry exists. Absent addresses are left untouched.
+    fn remove_allowed_if_present(env: &Env, address: Address) {
+        let key = DataKey::Allowed(address.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            AllowRemove { address }.publish(env);
+        }
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {

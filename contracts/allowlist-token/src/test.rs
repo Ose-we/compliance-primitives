@@ -516,25 +516,46 @@ fn test_delegated_add_to_allowlist_rejects_non_admin_key() {
 #[test]
 fn test_remove_from_allowlist_never_added_is_noop() {
     let env = Env::default();
-    let (admin, _token_id, contract_id, client) = setup(&env);
+    let (admin, _token_id, _contract_id, client) = setup(&env);
     let never_added = Address::generate(&env);
 
     assert!(!client.is_allowed(&never_added));
 
     client.remove_from_allowlist(&admin, &never_added);
 
+    // No AllowRemove event for an address that was never allowlisted.
+    assert_eq!(env.events().all(), vec![&env]);
+    assert!(!client.is_allowed(&never_added));
+    assert!(client.get_allowlist_entry(&never_added).is_none());
+}
+
+#[test]
+fn test_remove_multiple_skips_absent_addresses_without_events() {
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let never_added = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    client.remove_multiple_from_allowlist(
+        &admin,
+        &vec![&env, never_added.clone(), alice.clone()],
+    );
+
+    // Only the real removal (alice) emits an event; the absent address does not.
     assert_eq!(
         env.events().all(),
         vec![
             &env,
             (
                 contract_id.clone(),
-                (Symbol::new(&env, "allow_remove"), never_added.clone()).into_val(&env),
+                (Symbol::new(&env, "allow_remove"), alice.clone()).into_val(&env),
                 Map::<Symbol, Val>::new(&env).into_val(&env),
             ),
         ]
     );
-    assert!(!client.is_allowed(&never_added));
+    assert!(!client.is_allowed(&alice));
+    assert!(client.get_allowlist_entry(&never_added).is_none());
 }
 
 #[test]
