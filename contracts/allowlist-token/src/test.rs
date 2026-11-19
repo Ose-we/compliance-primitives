@@ -1684,3 +1684,109 @@ fn test_transfer_blocked_after_time_limited_entry_expires() {
         Some(1_500)
     );
 }
+
+// ─── Allowlist provenance (added_by / added_at_ledger) ───────────────────────
+
+#[test]
+fn test_add_to_allowlist_records_approver_and_ledger() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(777);
+    let alice = Address::generate(&env);
+
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    let entry = client.get_allowlist_entry(&alice).unwrap();
+    assert_eq!(entry.expiration_ledger, None);
+    assert_eq!(entry.added_by, Some(admin));
+    assert_eq!(entry.added_at_ledger, Some(777));
+}
+
+#[test]
+fn test_add_multiple_to_allowlist_records_approver_and_ledger() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(888);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    client.add_multiple_to_allowlist(&admin, &vec![&env, alice.clone(), bob.clone()], &None);
+
+    for addr in [&alice, &bob] {
+        let entry = client.get_allowlist_entry(addr).unwrap();
+        assert_eq!(entry.added_by, Some(admin.clone()));
+        assert_eq!(entry.added_at_ledger, Some(888));
+    }
+}
+
+#[test]
+fn test_delegated_add_records_configured_admin_as_approver() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let signing_key = delegated_signing_key();
+    let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &pubkey);
+
+    env.ledger().set_timestamp(100);
+    env.ledger().set_sequence_number(555);
+    let expiry = 200u64;
+    let signature = sign_delegated_action(&env, &signing_key, &alice, 1, expiry);
+    client.add_to_allowlist_delegated(
+        &admin,
+        &alice,
+        &1u64,
+        &expiry,
+        &default_valid_until(&env),
+        &signature,
+    );
+
+    let entry = client.get_allowlist_entry(&alice).unwrap();
+    assert_eq!(entry.added_by, Some(admin));
+    assert_eq!(entry.added_at_ledger, Some(555));
+}
+
+#[test]
+fn test_readding_entry_replaces_provenance_with_latest_approval() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    env.ledger().set_sequence_number(10);
+    client.add_to_allowlist(&admin, &alice, &None);
+    env.ledger().set_sequence_number(20);
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    assert_eq!(client.get_allowlist_entry(&alice).unwrap().added_at_ledger, Some(20));
+}
+
+#[test]
+fn test_remove_clears_provenance() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+
+    client.remove_from_allowlist(&admin, &alice);
+
+    assert!(client.get_allowlist_entry(&alice).is_none());
+}
+
+#[test]
+fn test_entry_without_provenance_reports_none_for_approver_fields() {
+    let env = Env::default();
+    let (_admin, _token_id, contract_id, client) = setup(&env);
+    let legacy = Address::generate(&env);
+
+    // Simulate an entry written before provenance was recorded.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowed(legacy.clone()), &AllowlistEntry { expiration_ledger: None });
+    });
+
+    let entry = client.get_allowlist_entry(&legacy).unwrap();
+    assert_eq!(entry.added_by, None);
+    assert_eq!(entry.added_at_ledger, None);
+    assert!(client.is_allowed(&legacy));
+}

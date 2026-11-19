@@ -114,12 +114,36 @@ enum DataKey {
     Frozen(Address),
     /// When `true`, `clawback` only succeeds against a frozen address. Instance storage.
     ClawbackRequiresFreeze,
+    /// Who approved an allowlist entry and at which ledger. Kept under its own
+    /// key, not inside `AllowlistEntry`, so existing entries keep their stored
+    /// shape. Persistent storage.
+    AllowedProvenance(Address),
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub struct AllowlistEntry {
     pub expiration_ledger: Option<u32>,
+}
+
+/// Approval record for an allowlist entry: the admin that approved it and the
+/// ledger it was approved at. Stored under `DataKey::AllowedProvenance`.
+#[contracttype]
+#[derive(Clone)]
+pub struct AllowlistProvenance {
+    pub added_by: Address,
+    pub added_at_ledger: u32,
+}
+
+/// Allowlist entry as returned by `get_allowlist_entry`: the stored expiry
+/// plus approval provenance. `added_by` and `added_at_ledger` are `None` for
+/// entries approved before provenance was recorded.
+#[contracttype]
+#[derive(Clone)]
+pub struct AllowlistEntryInfo {
+    pub expiration_ledger: Option<u32>,
+    pub added_by: Option<Address>,
+    pub added_at_ledger: Option<u32>,
 }
 
 #[contractevent]
@@ -393,15 +417,7 @@ impl AllowlistToken {
                 return Err(Error::InvalidInput);
             }
         }
-        let key = DataKey::Allowed(address.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &AllowlistEntry { expiration_ledger });
-        env.storage().persistent().extend_ttl(
-            &key,
-            ALLOWED_TTL_THRESHOLD,
-            ALLOWED_TTL_EXTEND_TO,
-        );
+        Self::write_allowlist_entry(&env, &address, expiration_ledger, &admin);
         AllowAdd { address }.publish(&env);
         Ok(())
     }
@@ -441,15 +457,7 @@ impl AllowlistToken {
         }
 
         for address in addresses.iter() {
-            let key = DataKey::Allowed(address.clone());
-            env.storage()
-                .persistent()
-                .set(&key, &AllowlistEntry { expiration_ledger });
-            env.storage().persistent().extend_ttl(
-                &key,
-                ALLOWED_TTL_THRESHOLD,
-                ALLOWED_TTL_EXTEND_TO,
-            );
+            Self::write_allowlist_entry(&env, &address, expiration_ledger, &admin);
             AllowAdd { address }.publish(&env);
         }
         Ok(())
@@ -518,15 +526,7 @@ impl AllowlistToken {
             Ok(_) => {}
             Err(_) => return Err(Error::NotAuthorized),
         }
-        let key = DataKey::Allowed(address.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &AllowlistEntry { expiration_ledger: None });
-        env.storage().persistent().extend_ttl(
-            &key,
-            ALLOWED_TTL_THRESHOLD,
-            ALLOWED_TTL_EXTEND_TO,
-        );
+        Self::write_allowlist_entry(&env, &address, None, &admin);
         AllowAdd { address }.publish(&env);
         Ok(())
     }
@@ -886,12 +886,26 @@ impl AllowlistToken {
         }
     }
 
-    /// Returns the raw allowlist entry stored for `address`, if any.
+    /// Returns the allowlist entry for `address`, if any, including who
+    /// approved it (`added_by`) and at which ledger (`added_at_ledger`).
     ///
+    /// Provenance is `None` for entries approved before it was recorded.
     /// An already-expired entry is still returned here (it is only ignored,
     /// not deleted) — use `is_allowed` for the effective status.
-    pub fn get_allowlist_entry(env: Env, address: Address) -> Option<AllowlistEntry> {
-        env.storage().persistent().get(&DataKey::Allowed(address))
+    pub fn get_allowlist_entry(env: Env, address: Address) -> Option<AllowlistEntryInfo> {
+        let entry: AllowlistEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowed(address.clone()))?;
+        let provenance: Option<AllowlistProvenance> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllowedProvenance(address));
+        Some(AllowlistEntryInfo {
+            expiration_ledger: entry.expiration_ledger,
+            added_by: provenance.as_ref().map(|p| p.added_by.clone()),
+            added_at_ledger: provenance.map(|p| p.added_at_ledger),
+        })
     }
 
     /// Unified compliance check — returns `true` if `address` is on the
@@ -1058,19 +1072,49 @@ impl AllowlistToken {
     /// Returns whether `address` has an active (non-expired) allowlist entry.
     /// Refreshes the entry's TTL when it is active.
     fn is_allowed_and_extend_ttl(env: &Env, address: Address) -> bool {
+        let address_for_provenance = address.clone();
         let key = DataKey::Allowed(address);
         let entry: Option<AllowlistEntry> = env.storage().persistent().get(&key);
         match entry {
             Some(entry) if Self::entry_is_active(env, &entry) => {
-                env.storage().persistent().extend_ttl(
-                    &key,
-                    ALLOWED_TTL_THRESHOLD,
-                    ALLOWED_TTL_EXTEND_TO,
-                );
+                Self::extend_allowed_ttl(env, &key);
+                let provenance_key = DataKey::AllowedProvenance(address_for_provenance);
+                if env.storage().persistent().has(&provenance_key) {
+                    Self::extend_allowed_ttl(env, &provenance_key);
+                }
                 true
             }
             _ => false,
         }
+    }
+
+    /// Writes the allowlist entry and its provenance, then extends both TTLs.
+    fn write_allowlist_entry(
+        env: &Env,
+        address: &Address,
+        expiration_ledger: Option<u32>,
+        added_by: &Address,
+    ) {
+        let key = DataKey::Allowed(address.clone());
+        env.storage()
+            .persistent()
+            .set(&key, &AllowlistEntry { expiration_ledger });
+        let provenance_key = DataKey::AllowedProvenance(address.clone());
+        env.storage().persistent().set(
+            &provenance_key,
+            &AllowlistProvenance {
+                added_by: added_by.clone(),
+                added_at_ledger: env.ledger().sequence(),
+            },
+        );
+        Self::extend_allowed_ttl(env, &key);
+        Self::extend_allowed_ttl(env, &provenance_key);
+    }
+
+    fn extend_allowed_ttl(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, ALLOWED_TTL_THRESHOLD, ALLOWED_TTL_EXTEND_TO);
     }
 
     /// Removes the allowlist entry for `address` and emits `AllowRemove`, but
@@ -1079,6 +1123,9 @@ impl AllowlistToken {
         let key = DataKey::Allowed(address.clone());
         if env.storage().persistent().has(&key) {
             env.storage().persistent().remove(&key);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AllowedProvenance(address.clone()));
             AllowRemove { address }.publish(env);
         }
     }
