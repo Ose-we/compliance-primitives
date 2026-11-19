@@ -1613,3 +1613,74 @@ fn test_delegated_valid_until_ledger_is_bound_by_signature() {
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
 }
+
+// ─── Time-limited allowlist entries (add_to_allowlist_until) ─────────────────
+
+#[test]
+fn test_add_to_allowlist_until_stores_expiry_on_entry() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+
+    client.add_to_allowlist_until(&admin, &alice, &1_500);
+
+    let entry = client.get_allowlist_entry(&alice).unwrap();
+    assert_eq!(entry.expiration_ledger, Some(1_500));
+}
+
+#[test]
+fn test_add_to_allowlist_until_is_allowed_through_boundary_ledger() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+    client.add_to_allowlist_until(&admin, &alice, &1_500);
+
+    // Inclusive: still allowed on the expiry ledger itself.
+    env.ledger().set_sequence_number(1_500);
+    assert!(client.is_allowed(&alice));
+    assert!(client.is_compliant(&alice));
+
+    // Not allowed from the ledger after expiry onward.
+    env.ledger().set_sequence_number(1_501);
+    assert!(!client.is_allowed(&alice));
+    assert!(!client.is_compliant(&alice));
+}
+
+#[test]
+fn test_add_to_allowlist_until_rejects_expiry_in_the_past() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+
+    assert_eq!(
+        client.try_add_to_allowlist_until(&admin, &alice, &999),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_transfer_blocked_after_time_limited_entry_expires() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    env.ledger().set_sequence_number(1_000);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_to_allowlist_until(&admin, &alice, &1_500);
+    client.add_to_allowlist(&admin, &bob, &None);
+
+    // On the expiry ledger the transfer is still forwarded.
+    env.ledger().set_sequence_number(1_500);
+    assert!(client.transfer(&alice, &bob, &10));
+
+    // After expiry the expired sender is blocked; the entry itself is kept.
+    env.ledger().set_sequence_number(1_501);
+    assert!(!client.transfer(&alice, &bob, &10));
+    assert_eq!(
+        client.get_allowlist_entry(&alice).unwrap().expiration_ledger,
+        Some(1_500)
+    );
+}

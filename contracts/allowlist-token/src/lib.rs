@@ -406,6 +406,22 @@ impl AllowlistToken {
         Ok(())
     }
 
+    /// Allowlist `address` until ledger `valid_until` (inclusive), for KYC or
+    /// onboarding approvals that expire. Admin-only.
+    ///
+    /// The expiry is stored on the entry. `is_allowed` and transfers treat the
+    /// address as allowlisted through ledger `valid_until` and as not
+    /// allowlisted from ledger `valid_until + 1` onward. Returns
+    /// `Err(InvalidInput)` if `valid_until` is already in the past.
+    pub fn add_to_allowlist_until(
+        env: Env,
+        admin: Address,
+        address: Address,
+        valid_until: u32,
+    ) -> Result<(), Error> {
+        Self::add_to_allowlist(env, admin, address, Some(valid_until))
+    }
+
     /// Add every address to the allowlist. Admin-only; each entry receives the
     /// same optional expiration ledger and an individual `AllowAdd` event.
     pub fn add_multiple_to_allowlist(
@@ -866,12 +882,7 @@ impl AllowlistToken {
             env.storage().persistent().get(&DataKey::Allowed(address));
         match entry {
             None => false,
-            Some(AllowlistEntry {
-                expiration_ledger: None,
-            }) => true,
-            Some(AllowlistEntry {
-                expiration_ledger: Some(exp),
-            }) => env.ledger().sequence() <= exp,
+            Some(entry) => Self::entry_is_active(&env, &entry),
         }
     }
 
@@ -1035,17 +1046,31 @@ impl AllowlistToken {
             .unwrap_or(false)
     }
 
+    /// An entry is active unless it has an expiration ledger that is already
+    /// in the past (`current sequence > expiration_ledger`).
+    fn entry_is_active(env: &Env, entry: &AllowlistEntry) -> bool {
+        match entry.expiration_ledger {
+            None => true,
+            Some(exp) => env.ledger().sequence() <= exp,
+        }
+    }
+
+    /// Returns whether `address` has an active (non-expired) allowlist entry.
+    /// Refreshes the entry's TTL when it is active.
     fn is_allowed_and_extend_ttl(env: &Env, address: Address) -> bool {
         let key = DataKey::Allowed(address);
-        let allowed = env.storage().persistent().get(&key).unwrap_or(false);
-        if allowed {
-            env.storage().persistent().extend_ttl(
-                &key,
-                ALLOWED_TTL_THRESHOLD,
-                ALLOWED_TTL_EXTEND_TO,
-            );
+        let entry: Option<AllowlistEntry> = env.storage().persistent().get(&key);
+        match entry {
+            Some(entry) if Self::entry_is_active(env, &entry) => {
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    ALLOWED_TTL_THRESHOLD,
+                    ALLOWED_TTL_EXTEND_TO,
+                );
+                true
+            }
+            _ => false,
         }
-        Err(Error::NotAuthorized)
     }
 
     /// Removes the allowlist entry for `address` and emits `AllowRemove`, but
