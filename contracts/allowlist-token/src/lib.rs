@@ -78,10 +78,10 @@ use soroban_sdk::{
 
 /// Extend a persistent allowlist entry when its remaining TTL drops below
 /// this many ledgers (~7 days at ~5s/ledger on mainnet).
-pub(crate) const ALLOWED_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+pub(crate) const ALLOWED_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD; // ~7 days
 
 /// Target remaining TTL after extension (~90 days at ~5s/ledger).
-pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; // ~90 days
 
 /// Maximum number of addresses accepted by a batch allowlist operation.
 pub const MAX_BATCH_SIZE: u32 = 45;
@@ -89,9 +89,9 @@ pub const MAX_BATCH_SIZE: u32 = 45;
 /// Instance-storage TTL policy: whenever the remaining instance TTL drops
 /// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
 /// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
-pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+pub const INSTANCE_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD; // ~7 days
 /// Target instance TTL after an extension.
-pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+pub const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; // ~90 days
 
 #[contracttype]
 #[derive(Clone)]
