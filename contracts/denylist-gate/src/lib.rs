@@ -720,10 +720,26 @@ impl DenylistGate {
     /// **Not** affected by pause state — reads always succeed.
     pub fn check(env: Env, address: Address) -> bool {
         Self::extend_instance_ttl(&env);
-        !env.storage()
-            .persistent()
-            .get(&DataKey::Denied(address))
-            .unwrap_or(false)
+        !Self::is_denied(&env, &address)
+    }
+
+    /// Batched form of [`is_denylisted`]: returns one flag per input address,
+    /// in the same order, where `true` means the address IS on the denylist.
+    ///
+    /// Intended for screening many counterparties in one call. Fails with
+    /// `BatchTooLarge` if more than `MAX_BATCH_SIZE` addresses are passed.
+    ///
+    /// **Not** affected by pause state — reads always succeed.
+    pub fn is_denylisted_batch(env: Env, addresses: Vec<Address>) -> Result<Vec<bool>, Error> {
+        if addresses.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        Self::extend_instance_ttl(&env);
+        let mut flags = Vec::new(&env);
+        for address in addresses.iter() {
+            flags.push_back(Self::is_denied(&env, &address));
+        }
+        Ok(flags)
     }
 
     /// Unified compliance check — returns `true` if `address` is NOT on the
@@ -1055,6 +1071,14 @@ impl DenylistGate {
             count.saturating_sub(1)
         };
         env.storage().instance().set(&DataKey::DenylistCount, &updated);
+    }
+
+    /// Whether `address` is currently denylisted.
+    fn is_denied(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Denied(address.clone()))
+            .unwrap_or(false)
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {
