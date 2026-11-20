@@ -91,7 +91,12 @@ enum DataKey {
     ComplianceOfficer,
     AuditLog,
     SignerSet,
+    /// Legacy denylist flag (`true`) written before entries carried metadata.
+    /// Still honoured by `check()`; superseded by `DenyEntry` on the next
+    /// add or removal. Never written by current code.
     Denied(Address),
+    /// Denylist entry with its metadata (`DenyEntry`). Persistent storage.
+    DenyEntry(Address),
     /// Number of addresses currently on the denylist. Instance storage.
     DenylistCount,
     PendingUpgrade,
@@ -107,6 +112,25 @@ enum DataKey {
 pub struct UpgradeState {
     pub new_wasm: BytesN<32>,
     pub activated_at: u64,
+}
+
+/// Metadata recorded when an address is added to the denylist.
+///
+/// `added_at` is the ledger timestamp (seconds since the Unix epoch) of the
+/// first add. `added_by` is the admin or compliance officer that made it.
+/// Re-adding an address that is already denied keeps the original values.
+///
+/// **Migration.** Entries written before this struct existed are stored as a
+/// bare `true` flag and have no `DenyEntry`. They remain denylisted (`check`
+/// still reports them), but `get_denylist_entry` returns `None` for them and
+/// they are not included in `denylist_count`. To give such an entry metadata
+/// and count it, re-add it with `add_to_denylist`; that writes a `DenyEntry`
+/// and drops the legacy flag.
+#[contracttype]
+#[derive(Clone)]
+pub struct DenyEntry {
+    pub added_at: u64,
+    pub added_by: Address,
 }
 
 /// Current on-chain schema version for this contract instance.
@@ -639,17 +663,7 @@ impl DenylistGate {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
 
-        const MAX_TTL: u32 = 6_311_520;
-        const THRESHOLD: u32 = MAX_TTL / 2;
-
-        let key = DataKey::Denied(address.clone());
-        if !env.storage().persistent().has(&key) {
-            Self::bump_denylist_count(&env, true);
-        }
-        env.storage().persistent().set(&key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, THRESHOLD, MAX_TTL);
+        Self::record_entry(&env, &admin, &address);
 
         DenyAdd {
             address: address.clone(),
@@ -663,11 +677,7 @@ impl DenylistGate {
     pub fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
-        let key = DataKey::Denied(address.clone());
-        if env.storage().persistent().has(&key) {
-            env.storage().persistent().remove(&key);
-            Self::bump_denylist_count(&env, false);
-        }
+        Self::remove_entry(&env, &address);
         DenyRemove {
             address: address.clone(),
         }
@@ -689,17 +699,26 @@ impl DenylistGate {
         }
 
         for address in addresses.iter() {
-            let key = DataKey::Denied(address.clone());
-            if env.storage().persistent().has(&key) {
-                env.storage().persistent().remove(&key);
-                Self::bump_denylist_count(&env, false);
-            }
+            Self::remove_entry(&env, &address);
             DenyRemove { address }.publish(&env);
         }
         Ok(())
     }
 
+    /// Return the metadata recorded for a denylist entry, if one exists.
+    ///
+    /// Returns `None` for addresses that are not denylisted and for legacy
+    /// entries written before `DenyEntry` existed (see [`DenyEntry`]).
+    pub fn get_denylist_entry(env: Env, address: Address) -> Option<DenyEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DenyEntry(address))
+    }
+
     /// Number of addresses currently on the denylist.
+    ///
+    /// Counts entries recorded as a `DenyEntry`. Legacy entries (see
+    /// [`DenyEntry`]) are not counted until they are re-added.
     ///
     /// Maintained on actual state changes only: an add counts only when the
     /// address was not already denied, and a removal counts only when the
@@ -1075,10 +1094,59 @@ impl DenylistGate {
 
     /// Whether `address` is currently denylisted.
     fn is_denied(env: &Env, address: &Address) -> bool {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::DenyEntry(address.clone()))
+        {
+            return true;
+        }
         env.storage()
             .persistent()
             .get(&DataKey::Denied(address.clone()))
             .unwrap_or(false)
+    }
+
+    /// Record `address` as denylisted. An existing `DenyEntry` keeps its
+    /// original metadata; a new one is stamped with the current ledger time
+    /// and `by`. Any legacy flag for the address is dropped, since the
+    /// `DenyEntry` supersedes it.
+    fn record_entry(env: &Env, by: &Address, address: &Address) {
+        const MAX_TTL: u32 = 6_311_520;
+        const THRESHOLD: u32 = MAX_TTL / 2;
+
+        let key = DataKey::DenyEntry(address.clone());
+        let entry = match env.storage().persistent().get::<DataKey, DenyEntry>(&key) {
+            Some(existing) => existing,
+            None => {
+                Self::bump_denylist_count(env, true);
+                DenyEntry {
+                    added_at: env.ledger().timestamp(),
+                    added_by: by.clone(),
+                }
+            }
+        };
+        env.storage().persistent().set(&key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, THRESHOLD, MAX_TTL);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Denied(address.clone()));
+    }
+
+    /// Remove `address` from the denylist, whether it is stored as a
+    /// `DenyEntry` or as a legacy flag. Only a `DenyEntry` was counted, so
+    /// only that removal decrements `denylist_count`.
+    fn remove_entry(env: &Env, address: &Address) {
+        let key = DataKey::DenyEntry(address.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            Self::bump_denylist_count(env, false);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Denied(address.clone()));
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {
