@@ -131,6 +131,11 @@ pub struct UpgradeState {
 pub struct DenyEntry {
     pub added_at: u64,
     pub added_by: Address,
+    /// Ledger sequence at which the entry stops applying. The address is
+    /// denylisted while `current ledger < expires_at_ledger`. `None` means the
+    /// entry lasts until it is removed. Set by `add_to_denylist_until`, and
+    /// reset to `None` by `add_to_denylist`.
+    pub expires_at_ledger: Option<u32>,
 }
 
 /// Current on-chain schema version for this contract instance.
@@ -361,6 +366,7 @@ pub enum Error {
     NoPendingAdmin = 13,
     PendingAdminMismatch = 14,
     UpgradeDelayTooShort = 15,
+    InvalidExpiry = 16,
 }
 
 // ---------------------------------------------------------------------------
@@ -660,10 +666,43 @@ impl DenylistGate {
     /// separately: Soroban never extends instance TTL implicitly, so every
     /// write path (and `check`) calls `extend_instance_ttl` explicitly.
     pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
-        Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
+        Self::deny(&env, &admin, &address, None)
+    }
 
-        Self::record_entry(&env, &admin, &address);
+    /// Add `address` to the denylist for a limited time. Admin or compliance-officer.
+    ///
+    /// The address is denylisted while the current ledger sequence is below
+    /// `until_ledger`, and clear from `until_ledger` onwards. `until_ledger`
+    /// must be in the future (`InvalidExpiry` otherwise). Calling this on an
+    /// address that is already denylisted replaces its expiry.
+    ///
+    /// Expired entries are not removed from storage, so they still count in
+    /// `denylist_count` until `remove_from_denylist` is called for them.
+    pub fn add_to_denylist_until(
+        env: Env,
+        admin: Address,
+        address: Address,
+        until_ledger: u32,
+    ) -> Result<(), Error> {
+        Self::deny(&env, &admin, &address, Some(until_ledger))
+    }
+
+    /// Shared body of the add entry points.
+    fn deny(
+        env: &Env,
+        admin: &Address,
+        address: &Address,
+        expires_at_ledger: Option<u32>,
+    ) -> Result<(), Error> {
+        Self::reject_if_paused(env)?;
+        Self::require_compliance_authority(env, admin)?;
+        if let Some(until) = expires_at_ledger {
+            if until <= env.ledger().sequence() {
+                return Err(Error::InvalidExpiry);
+            }
+        }
+
+        Self::record_entry(env, admin, address, expires_at_ledger);
 
         DenyAdd {
             address: address.clone(),
@@ -1094,12 +1133,15 @@ impl DenylistGate {
 
     /// Whether `address` is currently denylisted.
     fn is_denied(env: &Env, address: &Address) -> bool {
-        if env
+        if let Some(entry) = env
             .storage()
             .persistent()
-            .has(&DataKey::DenyEntry(address.clone()))
+            .get::<DataKey, DenyEntry>(&DataKey::DenyEntry(address.clone()))
         {
-            return true;
+            return match entry.expires_at_ledger {
+                Some(until) => env.ledger().sequence() < until,
+                None => true,
+            };
         }
         env.storage()
             .persistent()
@@ -1107,25 +1149,33 @@ impl DenylistGate {
             .unwrap_or(false)
     }
 
-    /// Record `address` as denylisted. An existing `DenyEntry` keeps its
-    /// original metadata; a new one is stamped with the current ledger time
-    /// and `by`. Any legacy flag for the address is dropped, since the
+    /// Record `address` as denylisted with the given expiry. An existing
+    /// `DenyEntry` keeps its original `added_at`/`added_by`; a new one is
+    /// stamped with the current ledger time and `by`. The expiry is always
+    /// replaced. Any legacy flag for the address is dropped, since the
     /// `DenyEntry` supersedes it.
-    fn record_entry(env: &Env, by: &Address, address: &Address) {
+    fn record_entry(
+        env: &Env,
+        by: &Address,
+        address: &Address,
+        expires_at_ledger: Option<u32>,
+    ) {
         const MAX_TTL: u32 = 6_311_520;
         const THRESHOLD: u32 = MAX_TTL / 2;
 
         let key = DataKey::DenyEntry(address.clone());
-        let entry = match env.storage().persistent().get::<DataKey, DenyEntry>(&key) {
+        let mut entry = match env.storage().persistent().get::<DataKey, DenyEntry>(&key) {
             Some(existing) => existing,
             None => {
                 Self::bump_denylist_count(env, true);
                 DenyEntry {
                     added_at: env.ledger().timestamp(),
                     added_by: by.clone(),
+                    expires_at_ledger: None,
                 }
             }
         };
+        entry.expires_at_ledger = expires_at_ledger;
         env.storage().persistent().set(&key, &entry);
         env.storage()
             .persistent()
