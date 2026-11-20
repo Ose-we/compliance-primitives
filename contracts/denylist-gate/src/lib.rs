@@ -92,6 +92,8 @@ enum DataKey {
     AuditLog,
     SignerSet,
     Denied(Address),
+    /// Number of addresses currently on the denylist. Instance storage.
+    DenylistCount,
     PendingUpgrade,
     /// Approvals collected so far for one pending signer-set change.
     /// Persistent storage (not instance), so abandoned proposals do not bloat
@@ -356,6 +358,7 @@ impl DenylistGate {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::DenylistCount, &0u32);
         Ok(())
     }
 
@@ -640,6 +643,9 @@ impl DenylistGate {
         const THRESHOLD: u32 = MAX_TTL / 2;
 
         let key = DataKey::Denied(address.clone());
+        if !env.storage().persistent().has(&key) {
+            Self::bump_denylist_count(&env, true);
+        }
         env.storage().persistent().set(&key, &true);
         env.storage()
             .persistent()
@@ -657,9 +663,11 @@ impl DenylistGate {
     pub fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Denied(address.clone()));
+        let key = DataKey::Denied(address.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            Self::bump_denylist_count(&env, false);
+        }
         DenyRemove {
             address: address.clone(),
         }
@@ -681,12 +689,28 @@ impl DenylistGate {
         }
 
         for address in addresses.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Denied(address.clone()));
+            let key = DataKey::Denied(address.clone());
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                Self::bump_denylist_count(&env, false);
+            }
             DenyRemove { address }.publish(&env);
         }
         Ok(())
+    }
+
+    /// Number of addresses currently on the denylist.
+    ///
+    /// Maintained on actual state changes only: an add counts only when the
+    /// address was not already denied, and a removal counts only when the
+    /// address was denied. Repeated adds/removes and removals of non-denied
+    /// addresses leave the count unchanged.
+    pub fn denylist_count(env: Env) -> u32 {
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::DenylistCount)
+            .unwrap_or(0)
     }
 
     /// Returns `true` if `address` is clear to transact, i.e. it is NOT on
@@ -1015,6 +1039,22 @@ impl DenylistGate {
                 .publish(env);
             }
         }
+    }
+
+    /// Adjust the denylist counter by one. Saturates at the bounds so a
+    /// bookkeeping mismatch can never wrap around.
+    fn bump_denylist_count(env: &Env, increment: bool) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DenylistCount)
+            .unwrap_or(0);
+        let updated = if increment {
+            count.saturating_add(1)
+        } else {
+            count.saturating_sub(1)
+        };
+        env.storage().instance().set(&DataKey::DenylistCount, &updated);
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {
