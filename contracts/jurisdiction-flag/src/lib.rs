@@ -66,6 +66,10 @@ pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
 /// legitimate multi-jurisdiction use case (an address is rarely subject to
 /// more than a handful of applicable codes).
 pub const MAX_CODES_PER_ADDRESS: u32 = 8;
+/// Maximum number of member codes in one named jurisdiction group.
+pub const MAX_GROUP_CODES: u32 = 64;
+/// Maximum length in bytes of a jurisdiction group name.
+pub const MAX_GROUP_NAME_LEN: u32 = 32;
 
 #[contracttype]
 #[derive(Clone)]
@@ -83,6 +87,34 @@ enum DataKey {
     PendingIssuer,
     /// Pending issuer-authorized WASM upgrade proposal. Instance storage.
     PendingUpgrade,
+    /// Named jurisdiction group (e.g. `EU`) -> member codes. Persistent storage.
+    Group(String),
+    /// Contract-level [`JurisdictionMode`]. Instance storage; absent = allow-list.
+    Mode,
+}
+
+/// How `is_permitted_jurisdiction` interprets its code list.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JurisdictionMode {
+    /// The list names permitted jurisdictions (default).
+    AllowList,
+    /// The list names blocked jurisdictions; everything else is permitted.
+    BlockList,
+}
+
+/// Emitted when a named jurisdiction group is defined or replaced.
+#[contractevent]
+pub struct GroupSet {
+    #[topic]
+    pub name: String,
+    pub codes: Vec<String>,
+}
+
+/// Emitted when the contract-level jurisdiction mode changes.
+#[contractevent]
+pub struct ModeSet {
+    pub mode: JurisdictionMode,
 }
 
 /// Emitted whenever a jurisdiction flag is set.
@@ -175,6 +207,8 @@ pub enum Error {
     /// `add_jurisdiction` was called when the address already has
     /// [`MAX_CODES_PER_ADDRESS`] codes attached.
     TooManyCodes = 10,
+    /// `set_group` was given an empty or malformed group name, or no codes.
+    InvalidGroup = 11,
 }
 
 #[contract]
@@ -583,9 +617,17 @@ impl JurisdictionFlag {
         Self::load_active_jurisdictions(&env, &address).iter().next()
     }
 
-    /// Returns `true` if `address` has a jurisdiction code that appears in
-    /// `allowed_codes`. Meant to be called by other contracts enforcing a
-    /// permitted-jurisdiction policy.
+    /// Returns whether `address` is permitted under `allowed_codes`.
+    ///
+    /// Each entry of `allowed_codes` is either an ISO 3166-1 alpha-2 code or
+    /// the name of a group defined with [`set_group`](Self::set_group), which
+    /// expands to its member codes.
+    ///
+    /// In [`JurisdictionMode::AllowList`] mode (the default) the address is
+    /// permitted if any of its active codes matches the list. In
+    /// [`JurisdictionMode::BlockList`] mode the list names blocked
+    /// jurisdictions: the address is permitted if it has at least one active
+    /// code and none of them match the list.
     ///
     /// Returns `Err(Error::EmptyAllowedCodes)` if the `allowed_codes` list is empty.
     pub fn is_permitted_jurisdiction(
@@ -598,9 +640,77 @@ impl JurisdictionFlag {
             return Err(Error::EmptyAllowedCodes);
         }
         let codes = Self::load_active_jurisdictions(&env, &address);
-        Ok(allowed_codes
-            .iter()
-            .any(|allowed| codes.iter().any(|code| code == allowed)))
+        let matched = allowed_codes.iter().any(|entry| {
+            if codes.iter().any(|code| code == entry) {
+                return true;
+            }
+            match env
+                .storage()
+                .persistent()
+                .get::<DataKey, Vec<String>>(&DataKey::Group(entry))
+            {
+                Some(members) => members
+                    .iter()
+                    .any(|member| codes.iter().any(|code| code == member)),
+                None => false,
+            }
+        });
+        Ok(match Self::get_mode(env.clone()) {
+            JurisdictionMode::AllowList => matched,
+            JurisdictionMode::BlockList => !codes.is_empty() && !matched,
+        })
+    }
+
+    /// Define (or replace) a named jurisdiction group such as `EU` or `EEA`.
+    /// Issuer-only. `codes` must be non-empty valid alpha-2 codes, at most
+    /// [`MAX_GROUP_CODES`]. Group names may then be passed to
+    /// [`is_permitted_jurisdiction`](Self::is_permitted_jurisdiction).
+    pub fn set_group(
+        env: Env,
+        issuer: Address,
+        name: String,
+        codes: Vec<String>,
+    ) -> Result<(), Error> {
+        Self::require_issuer(&env, &issuer)?;
+        Self::reject_if_paused(&env)?;
+        if name.is_empty() || name.len() > MAX_GROUP_NAME_LEN || codes.is_empty() {
+            return Err(Error::InvalidGroup);
+        }
+        if codes.len() > MAX_GROUP_CODES {
+            return Err(Error::TooManyCodes);
+        }
+        for code in codes.iter() {
+            Self::validate_jurisdiction_code(&code)?;
+        }
+        let key = DataKey::Group(name.clone());
+        env.storage().persistent().set(&key, &codes);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        GroupSet { name, codes }.publish(&env);
+        Ok(())
+    }
+
+    /// Return the member codes of group `name`, if defined.
+    pub fn get_group(env: Env, name: String) -> Option<Vec<String>> {
+        env.storage().persistent().get(&DataKey::Group(name))
+    }
+
+    /// Set the contract-level [`JurisdictionMode`]. Issuer-only.
+    pub fn set_mode(env: Env, issuer: Address, mode: JurisdictionMode) -> Result<(), Error> {
+        Self::require_issuer(&env, &issuer)?;
+        Self::reject_if_paused(&env)?;
+        env.storage().instance().set(&DataKey::Mode, &mode);
+        ModeSet { mode }.publish(&env);
+        Ok(())
+    }
+
+    /// Return the current [`JurisdictionMode`] (default `AllowList`).
+    pub fn get_mode(env: Env) -> JurisdictionMode {
+        env.storage()
+            .instance()
+            .get(&DataKey::Mode)
+            .unwrap_or(JurisdictionMode::AllowList)
     }
 
     /// Unified compliance check — returns `true` if `address` has **any**
