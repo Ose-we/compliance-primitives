@@ -2,7 +2,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events as _};
-use soroban_sdk::{Env, IntoVal};
+use soroban_sdk::{xdr, Env, IntoVal, TryFromVal};
 
 fn setup(env: &Env) -> (Address, CircuitBreakerClient<'_>) {
     env.mock_all_auths();
@@ -11,6 +11,18 @@ fn setup(env: &Env) -> (Address, CircuitBreakerClient<'_>) {
     let client = CircuitBreakerClient::new(env, &contract_id);
     client.initialize(&admin);
     (admin, client)
+}
+
+fn event_topics(env: &Env, event_index: usize) -> std::vec::Vec<xdr::ScVal> {
+    let events = env.events().all();
+    let event = &events.events()[event_index];
+    let xdr::ContractEventBody::V0(body) = &event.body;
+    body.topics.iter().cloned().collect()
+}
+
+fn address_topic(env: &Env, address: &Address) -> xdr::ScVal {
+    let value: soroban_sdk::Val = address.clone().into_val(env);
+    xdr::ScVal::try_from_val(env, &value).unwrap()
 }
 
 #[test]
@@ -38,22 +50,14 @@ fn test_freeze_and_unfreeze_emit_events_with_admin() {
     let (admin, client) = setup(&env);
 
     client.freeze(&admin, &None);
-    let freeze_events = env.events().all();
-    let (_contract_id, topics, _data) = freeze_events.last().unwrap();
-    assert_eq!(
-        topics.get_unchecked(0),
-        soroban_sdk::Symbol::new(&env, "frozen").into_val(&env)
-    );
-    assert_eq!(topics.get_unchecked(1), admin.clone().into_val(&env));
+    let topics = event_topics(&env, 0);
+    assert_eq!(topics[0], xdr::ScVal::try_from_val(&env, &soroban_sdk::Symbol::new(&env, "frozen")).unwrap());
+    assert_eq!(topics[1], address_topic(&env, &admin));
 
     client.unfreeze(&admin);
-    let unfreeze_events = env.events().all();
-    let (_contract_id, topics, _data) = unfreeze_events.last().unwrap();
-    assert_eq!(
-        topics.get_unchecked(0),
-        soroban_sdk::Symbol::new(&env, "unfrozen").into_val(&env)
-    );
-    assert_eq!(topics.get_unchecked(1), admin.clone().into_val(&env));
+    let topics = event_topics(&env, 0);
+    assert_eq!(topics[0], xdr::ScVal::try_from_val(&env, &soroban_sdk::Symbol::new(&env, "unfrozen")).unwrap());
+    assert_eq!(topics[1], address_topic(&env, &admin));
 }
 
 #[test]
@@ -79,6 +83,61 @@ fn test_non_admin_cannot_freeze_or_unfreeze() {
 }
 
 #[test]
+fn test_guardian_can_freeze_but_cannot_unfreeze() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    client.add_guardian(&admin, &guardian);
+
+    client.freeze(&guardian, &None);
+    assert!(client.is_frozen());
+
+    let result = client.try_unfreeze(&guardian);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert!(client.is_frozen());
+
+    client.unfreeze(&admin);
+    assert!(!client.is_frozen());
+}
+
+#[test]
+fn test_freeze_history_records_actor_reason_and_unfreeze_time() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    let reason = soroban_sdk::String::from_str(&env, "incident response");
+    client.add_guardian(&admin, &guardian);
+
+    client.freeze(&guardian, &Some(reason.clone()));
+    let history = client.freeze_history(&10);
+    assert_eq!(history.len(), 1);
+    let record = history.get(0).unwrap();
+    assert_eq!(record.by, guardian);
+    assert_eq!(record.at, env.ledger().timestamp());
+    assert_eq!(record.until, None);
+    assert_eq!(record.reason, Some(reason));
+
+    client.unfreeze(&admin);
+    let closed = client.freeze_history(&1).get(0).unwrap();
+    assert_eq!(closed.until, Some(env.ledger().timestamp()));
+}
+
+#[test]
+fn test_freeze_history_is_bounded_and_limit_returns_newest_records() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+
+    for _ in 0..(MAX_FREEZE_HISTORY + 2) {
+        client.freeze(&admin, &None);
+        client.unfreeze(&admin);
+    }
+
+    let history = client.freeze_history(&(MAX_FREEZE_HISTORY + 1));
+    assert_eq!(history.len(), MAX_FREEZE_HISTORY);
+    assert_eq!(client.freeze_history(&1).len(), 1);
+}
+
+#[test]
 fn test_is_frozen_before_initialize_returns_not_initialized_error() {
     let env = Env::default();
     let contract_id = env.register(CircuitBreaker, ());
@@ -100,14 +159,14 @@ fn test_double_freeze_is_idempotent() {
     // Calling `freeze` twice in a row is a no-op the second time: state
     // stays frozen and the call itself succeeds rather than erroring.
     client.freeze(&admin, &None);
-    assert!(client.is_frozen());
     // Exactly one Frozen event should have been emitted so far.
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(env.events().all().events().len(), 1);
+    assert!(client.is_frozen());
 
     client.freeze(&admin, &None);
-    assert!(client.is_frozen());
     // Second freeze must NOT emit another event.
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(env.events().all().events().len(), 0);
+    assert!(client.is_frozen());
 }
 
 #[test]
@@ -120,12 +179,12 @@ fn test_double_unfreeze_is_idempotent() {
     client.unfreeze(&admin);
     assert!(!client.is_frozen());
     // Already unfrozen at init; first unfreeze call also should not emit.
-    assert_eq!(env.events().all().len(), 0);
+    assert_eq!(env.events().all().events().len(), 0);
 
     client.unfreeze(&admin);
     assert!(!client.is_frozen());
     // Still no events: both calls were no-ops.
-    assert_eq!(env.events().all().len(), 0);
+    assert_eq!(env.events().all().events().len(), 0);
 }
 
 #[test]
@@ -135,11 +194,11 @@ fn test_freeze_then_unfreeze_emits_exactly_one_event_each() {
 
     client.freeze(&admin, &None);
     // One Frozen event.
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(env.events().all().events().len(), 1);
 
     client.unfreeze(&admin);
     // One Frozen + one Unfrozen = two events total.
-    assert_eq!(env.events().all().len(), 2);
+    assert_eq!(env.events().all().events().len(), 1);
 }
 
 #[test]
@@ -185,10 +244,7 @@ fn test_metadata_after_initialization() {
 
     let metadata = client.metadata();
     assert_eq!(metadata.admin, admin);
-    assert_eq!(
-        metadata.version,
-        soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
-    );
+    assert_eq!(metadata.version, soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,17 +259,11 @@ fn test_propose_admin_emits_event() {
 
     client.propose_admin(&admin, &new_admin);
 
-    let events = env.events().all();
-    let (_contract_id, topics, _data) = events.last().unwrap();
-    assert_eq!(
-        topics,
-        (
-            soroban_sdk::Symbol::new(&env, "admin_proposed"),
-            admin.clone(),
-            new_admin,
-        )
-            .into_val(&env)
-    );
+    let topics = event_topics(&env, 0);
+    assert_eq!(topics.len(), 3);
+    assert_eq!(topics[0], xdr::ScVal::try_from_val(&env, &soroban_sdk::Symbol::new(&env, "admin_proposed")).unwrap());
+    assert_eq!(topics[1], address_topic(&env, &admin));
+    assert_eq!(topics[2], address_topic(&env, &new_admin));
 }
 
 #[test]
@@ -225,13 +275,12 @@ fn test_accept_admin_emits_transferred_event() {
     client.propose_admin(&admin, &new_admin);
     client.accept_admin(&new_admin);
 
-    let events = env.events().all();
-    let (_contract_id, topics, _data) = events.last().unwrap();
+    let topics = event_topics(&env, 0);
     assert_eq!(
-        topics.get_unchecked(0),
-        soroban_sdk::Symbol::new(&env, "admin_transferred").into_val(&env)
+        topics[0],
+        xdr::ScVal::try_from_val(&env, &soroban_sdk::Symbol::new(&env, "admin_transferred")).unwrap()
     );
-    assert_eq!(topics.get_unchecked(1), new_admin.clone().into_val(&env));
+    assert_eq!(topics[1], address_topic(&env, &new_admin));
 }
 
 // ---------------------------------------------------------------------------
@@ -365,10 +414,7 @@ fn read_baseline(path: &std::path::Path, section: &str) -> (u64, u64) {
 }
 
 fn baseline_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("budget-baselines.toml")
+    std::path::PathBuf::from(std::env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("budget-baselines.toml")
 }
 
 fn assert_budget_within_threshold(measured: (u64, u64), baseline: (u64, u64), label: &str) {
@@ -397,10 +443,7 @@ fn test_budget_regression_is_frozen() {
     assert!(!client.is_frozen());
 
     let measured = (budget.cpu_instruction_cost(), budget.memory_bytes_cost());
-    std::println!(
-        "circuit-breaker.is_frozen: cpu = {}, memory = {}",
-        measured.0, measured.1
-    );
+    std::println!("circuit-breaker.is_frozen: cpu = {}, memory = {}", measured.0, measured.1);
 
     let baseline = read_baseline(&baseline_path(), "circuit-breaker.is_frozen");
     assert_budget_within_threshold(measured, baseline, "circuit-breaker is_frozen");
