@@ -2,7 +2,7 @@ use crate::{
     is_paused, pause, pause_with_reason, paused_since, pause_reason, require_not_paused,
     require_paused, unpause,
 };
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
 /// Minimal harness contract so we can exercise the pausable helpers inside a
@@ -27,6 +27,14 @@ impl Harness {
 
     pub fn unpause(env: Env) {
         crate::unpause(&env);
+    }
+
+    pub fn pause_until(env: Env, until: u64) {
+        crate::pause_until(&env, until);
+    }
+
+    pub fn pause_until_at(env: Env) -> Option<u64> {
+        crate::pause_until_at(&env)
     }
 
     pub fn paused_since(env: Env) -> Option<u64> {
@@ -296,4 +304,54 @@ fn test_pause_no_reason_leaves_reason_none() {
     client.pause(); // no reason supplied
     assert!(client.is_paused());
     assert!(client.pause_reason().is_none());
+}
+
+// ─── Issue #804: automatic pause expiry ────────────────────────────────────
+
+#[test]
+fn test_pause_until_expires_automatically() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_700_000_000);
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    client.pause_until(&1_700_000_600);
+    assert!(client.is_paused());
+    assert_eq!(client.pause_until_at(), Some(1_700_000_600));
+    assert_eq!(client.paused_since(), Some(1_700_000_000));
+    assert!(client.check_paused());
+
+    // Half a second before expiry it is still paused; exactly at expiry it
+    // resumes without an explicit unpause.
+    env.ledger().set_timestamp(1_700_000_599);
+    assert!(client.is_paused());
+    env.ledger().set_timestamp(1_700_000_600);
+    assert!(!client.is_paused());
+    assert!(client.check_not_paused());
+    assert!(client.paused_since().is_none());
+}
+
+#[test]
+fn test_pause_until_in_the_past_is_a_noop() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_700_000_000);
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    client.pause_until(&1_699_999_999);
+    assert!(!client.is_paused());
+    assert!(client.pause_until_at().is_none());
+}
+
+#[test]
+fn test_unpause_clears_expiry() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_700_000_000);
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    client.pause_until(&1_700_001_000);
+    client.unpause();
+    assert!(!client.is_paused());
+    assert!(client.pause_until_at().is_none());
 }
