@@ -427,6 +427,32 @@ data   : {}
 |---|---|---|---|
 | `caller` | `Address` | topic | Admin or guardian address that froze the contract |
 
+#### `TimedFrozen`
+
+Emitted by `freeze_for(caller, ledgers)`. The freeze lifts automatically once
+the ledger sequence reaches `until_ledger`; `is_frozen` then returns `false`.
+
+```
+topics : ["timed_frozen", <caller: Address>]
+data   : { until_ledger: u32 }
+```
+
+#### `ScopeFrozen` / `ScopeUnfrozen`
+
+Emitted by `freeze_scope(caller, scope)` (admin or guardian) and
+`unfreeze_scope(admin, scope)` (admin only). Consumers check a single
+operation with `is_frozen_scope(scope)`; the global freeze (permanent or
+timed) always overrides and reports every scope as frozen.
+
+```
+topics : ["scope_frozen", <caller: Address>, <scope: Symbol>]
+topics : ["scope_unfrozen", <admin: Address>, <scope: Symbol>]
+data   : {}
+```
+
+Guardians are capped at `MAX_GUARDIANS` (10); `add_guardian` beyond the cap
+fails with `TooManyGuardians`. `list_guardians()` returns the current set.
+
 #### `Unfrozen`
 
 Emitted when the admin unfreezes the circuit breaker. Also emitted when the

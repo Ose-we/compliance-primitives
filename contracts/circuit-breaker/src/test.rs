@@ -405,3 +405,141 @@ fn test_budget_regression_is_frozen() {
     let baseline = read_baseline(&baseline_path(), "circuit-breaker.is_frozen");
     assert_budget_within_threshold(measured, baseline, "circuit-breaker is_frozen");
 }
+
+// ---- #778 timed freezes ----
+
+#[test]
+fn test_freeze_for_expires_automatically() {
+    use soroban_sdk::testutils::Ledger as _;
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    client.add_guardian(&admin, &guardian);
+    let start = env.ledger().sequence();
+    let until = client.freeze_for(&guardian, &100);
+    assert_eq!(until, start + 100);
+    assert!(client.is_frozen());
+    env.ledger().set_sequence_number(start + 99);
+    assert!(client.is_frozen());
+    env.ledger().set_sequence_number(start + 100);
+    assert!(!client.is_frozen());
+}
+
+#[test]
+fn test_freeze_for_emits_event_and_never_shortens() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let start = env.ledger().sequence();
+    client.freeze_for(&admin, &500);
+    assert!(!env.events().all().is_empty());
+    let until = client.freeze_for(&admin, &10);
+    assert_eq!(until, start + 500);
+}
+
+#[test]
+fn test_unfreeze_clears_timed_freeze() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    client.freeze_for(&admin, &1_000);
+    client.unfreeze(&admin);
+    assert!(!client.is_frozen());
+}
+
+#[test]
+fn test_freeze_for_rejects_outsider() {
+    let env = Env::default();
+    let (_admin, client) = setup(&env);
+    let outsider = Address::generate(&env);
+    assert_eq!(
+        client.try_freeze_for(&outsider, &10),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+// ---- #779 scoped freezes ----
+
+#[test]
+fn test_freeze_scope_only_affects_that_scope() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let mint = Symbol::new(&env, "mint");
+    let transfer = Symbol::new(&env, "transfer");
+    client.freeze_scope(&admin, &mint);
+    assert!(client.is_frozen_scope(&mint));
+    assert!(!client.is_frozen_scope(&transfer));
+    assert!(!client.is_frozen());
+    client.unfreeze_scope(&admin, &mint);
+    assert!(!client.is_frozen_scope(&mint));
+}
+
+#[test]
+fn test_global_freeze_overrides_scopes() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let transfer = Symbol::new(&env, "transfer");
+    client.freeze(&admin);
+    assert!(client.is_frozen_scope(&transfer));
+    client.unfreeze(&admin);
+    client.freeze_for(&admin, &50);
+    assert!(client.is_frozen_scope(&transfer));
+}
+
+#[test]
+fn test_guardian_cannot_unfreeze_scope() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    client.add_guardian(&admin, &guardian);
+    let mint = Symbol::new(&env, "mint");
+    client.freeze_scope(&guardian, &mint);
+    assert_eq!(
+        client.try_unfreeze_scope(&guardian, &mint),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+// ---- #780 list_guardians ----
+
+#[test]
+fn test_list_guardians() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    assert_eq!(client.list_guardians().len(), 0);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.add_guardian(&admin, &g1);
+    client.add_guardian(&admin, &g2);
+    let list = client.list_guardians();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap(), g1);
+    assert_eq!(list.get(1).unwrap(), g2);
+    client.remove_guardian(&admin, &g1);
+    assert_eq!(client.list_guardians().len(), 1);
+}
+
+// ---- #781 MAX_GUARDIANS ----
+
+#[test]
+fn test_add_guardian_enforces_max() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let mut first = None;
+    for _ in 0..MAX_GUARDIANS {
+        let g = Address::generate(&env);
+        if first.is_none() {
+            first = Some(g.clone());
+        }
+        client.add_guardian(&admin, &g);
+    }
+    let extra = Address::generate(&env);
+    assert_eq!(
+        client.try_add_guardian(&admin, &extra),
+        Err(Ok(Error::TooManyGuardians))
+    );
+    // Re-adding an existing guardian at the cap is still a no-op.
+    client.add_guardian(&admin, &first.clone().unwrap());
+    // Freeing a slot allows a new guardian.
+    client.remove_guardian(&admin, &first.unwrap());
+    client.add_guardian(&admin, &extra);
+    assert_eq!(client.list_guardians().len(), MAX_GUARDIANS);
+}
