@@ -9,8 +9,13 @@ Provide a single shared switch that can halt every composed compliance check in 
 Introduce a small shared `circuit-breaker` contract with three operations:
 
 - `initialize(admin)` sets the administrative key once.
-- `freeze(admin)` flips the breaker to the frozen state.
+- `freeze(caller, reason)` flips the breaker to the frozen state and records
+  the caller, ledger timestamp, and optional reason.
 - `unfreeze(admin)` restores normal operation.
+- `freeze_history(limit)` returns the newest freeze records, in chronological
+  order. The contract retains at most 20 records; an active incident has
+  `until: None`, which is filled with the unfreeze timestamp when operations
+  resume.
 
 Composed consumers should check the breaker first, before any per-contract compliance check or balance mutation. In this repository, the reference consumer example now resolves the breaker address during initialization and calls `is_frozen()` before proceeding with the denylist gate check and transfer.
 
@@ -21,6 +26,11 @@ Trust is asymmetric, matching fail-closed incident-response convention: halting 
 - **Freeze** is callable by the admin **or any guardian**. A guardian is an address in a freeze-only set that the admin manages via `add_guardian(admin, guardian)` and `remove_guardian(admin, guardian)`. `is_guardian(address)` reads membership. Guardians can freeze but cannot unfreeze, change guardians, or rotate the admin.
 - **Unfreeze** is **admin-only**. A guardian that froze the system cannot reopen it, so a compromised or mistaken guardian can stop flows but cannot restore them on its own.
 - Guardian and admin authorization both go through `require_auth()`, so a guardian freeze is an ordinary signed transaction from that guardian's key.
+
+The existing implementation was confirmed to require the configured admin for
+`unfreeze`; the contract test now explicitly covers a guardian's rejection
+after a guardian-initiated freeze. A successful admin unfreeze preserves that
+asymmetry.
 
 This means the admin key is no longer the only key that can react during an incident: if it is unavailable, any guardian can still halt the breaker. The admin still controls the guardian set, so guardian keys should be issued and revoked with the same care as the admin key itself. A multisig or threshold admin remains the recommended production setup; the guardian set complements it rather than replacing it.
 

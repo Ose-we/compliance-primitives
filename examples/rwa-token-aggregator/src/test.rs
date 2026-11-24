@@ -163,7 +163,7 @@ fn test_frozen_circuit_breaker_halts_transfers_through_aggregator() {
     let fx = setup(&env);
     let (alice, bob) = two_onboarded_parties(&env, &fx);
 
-    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin);
+    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin, &None);
 
     let result = fx.token.try_transfer(&alice, &bob, &400);
     assert_eq!(result, Err(Ok(Error::CircuitBreakerFrozen)));
@@ -182,7 +182,7 @@ fn test_breaker_takes_priority_over_denylist() {
     let fx = setup(&env);
     let (alice, bob) = two_onboarded_parties(&env, &fx);
     DenylistGateClient::new(&env, &fx.gate_id).add_to_denylist(&fx.gate_admin, &alice);
-    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin);
+    CircuitBreakerClient::new(&env, &fx.breaker_id).freeze(&fx.breaker_admin, &None);
 
     let result = fx.token.try_transfer(&alice, &bob, &400);
     assert_eq!(result, Err(Ok(Error::CircuitBreakerFrozen)));

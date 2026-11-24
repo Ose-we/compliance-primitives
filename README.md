@@ -29,10 +29,10 @@ one job:
 | [`jurisdiction-flag`](./contracts/jurisdiction-flag) | Attaches an issuer-controlled jurisdiction code (e.g. an ISO country code) to an address, with a helper (`is_permitted_jurisdiction`) other contracts can call to check an address against a permitted-jurisdictions list. |
 | [`audit-log`](./contracts/audit-log) | On-chain, append-only audit trail for compliance events emitted by other primitives, queryable by other contracts at invocation time. |
 | [`circuit-breaker`](./contracts/circuit-breaker) | Admin-controlled emergency freeze switch other contracts can check before allowing a transfer. |
-| [`compliance-aggregator`](./contracts/compliance-aggregator) | Batches `denylist-gate` and `jurisdiction-flag` checks into a single cross-contract call, returning an aggregated pass/fail plus a per-check breakdown. |
+| [`compliance-aggregator`](./contracts/compliance-aggregator) | Combines denylist, jurisdiction, and allowlist checks (plus an optional emergency breaker) behind one consumer call, with per-check results and optional failure details. |
 | [`multisig-admin`](./contracts/multisig-admin) | M-of-N multisig authorization, usable as the `admin`/`issuer` address of any of the other primitives via Soroban's custom-account interface. |
 | [`pausable`](./contracts/pausable) | Shared pause/unpause helper library composed into the other contracts at compile time. Not a deployable contract itself — no `#[contract]` macro or wasm exports. |
-| [`policy-engine`](./contracts/policy-engine) | Composes multiple compliance checks (denylist, jurisdiction) with configurable AND/OR logic into a single `evaluate` call. |
+| [`policy-engine`](./contracts/policy-engine) | Composes denylist, jurisdiction, allowlist, and circuit-breaker checks with configurable AND/OR logic into a single `evaluate` call. |
 
 [`/examples/denylist-gate-consumer`](./examples/denylist-gate-consumer) is a
 minimal reference token showing the cross-contract calling pattern for
