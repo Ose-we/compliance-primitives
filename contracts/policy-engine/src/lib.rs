@@ -96,7 +96,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
-    Address, BytesN, Env, String, Symbol, Vec,
+    Address, BytesN, Env, Map, String, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -132,6 +132,17 @@ pub trait CircuitBreakerInterface {
 #[contractclient(name = "AllowlistCheckClient")]
 pub trait AllowlistCheckInterface {
     fn is_allowed(env: Env, address: Address) -> bool;
+}
+
+/// Amount-aware compliance check interface.
+///
+/// Checks that need the transfer amount (e.g. travel-rule thresholds) can be
+/// plugged in by implementing `check_with_amount(address, amount)`. The
+/// engine calls this method from `evaluate_with_amount`; when no amount is
+/// supplied the engine falls back to the address-only `check` method.
+#[contractclient(name = "AmountAwareCheckClient")]
+pub trait AmountAwareCheckInterface {
+    fn check_with_amount(env: Env, address: Address, amount: i128) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,14 +278,33 @@ pub struct AddressPair {
     pub to: Address,
 }
 
+/// A single named policy: its admin, combination operator, checks, the
+/// configurable check limit and a monotonically increasing version.
+#[contracttype]
+#[derive(Clone)]
+pub struct Policy {
+    /// Address authorized to mutate this policy.
+    pub admin: Address,
+    /// How check results are combined (`All` = AND, `Any` = OR).
+    pub op: CombineOp,
+    /// The ordered list of checks that evaluation will run.
+    pub checks: Vec<CheckKind>,
+    /// Maximum number of checks this policy may hold (<= hard limit).
+    pub max_checks: u32,
+    /// Monotonic version, bumped on every mutation.
+    pub policy_version: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
     Admin,
-    Checks,
-    CombineOp,
+    /// Default policy name used by the legacy `evaluate(from, to)` entry point.
+    DefaultPolicy,
+    /// Map of policy name -> [`Policy`].
+    Policies,
     /// Address of the `circuit-breaker` contract to consult, if any. When
-    /// set and frozen, `evaluate` short-circuits to deny.
+    /// set and frozen, evaluation short-circuits to deny.
     CircuitBreaker,
     PendingUpgrade,
 }
@@ -325,11 +355,15 @@ pub enum Error {
     UpgradeNotReady = 9,
 }
 
-/// Maximum number of checks that can be registered in a single policy
-/// engine instance.  Chosen to keep per-`evaluate` cross-contract call
-/// overhead well within Soroban's instruction limits while still supporting
-/// all realistic compliance stack sizes.
+/// Default maximum number of checks that can be registered in a single
+/// policy. Chosen to keep per-evaluation cross-contract call overhead well
+/// within Soroban's instruction limits while still supporting all realistic
+/// compliance stack sizes.
 pub const MAX_CHECKS: u32 = 16;
+
+/// Hard upper bound on the configurable per-policy `max_checks`. An admin may
+/// lower a policy's limit below this but never raise it above.
+pub const MAX_CHECKS_HARD_LIMIT: u32 = 32;
 
 /// Extend the contract's instance storage when its remaining TTL drops below
 /// this many ledgers (~7 days at ~5s/ledger).
@@ -348,6 +382,10 @@ pub struct PolicyResult {
     pub passed: bool,
     pub from: Address,
     pub to: Address,
+    /// Name of the policy that produced this result.
+    pub policy_name: Symbol,
+    /// Version of the policy at evaluation time.
+    pub policy_version: u32,
 }
 
 /// Emitted whenever the contract is upgraded to a new WASM implementation,
@@ -424,8 +462,12 @@ pub struct CheckFailure {
 pub struct PolicyNode {
     /// How check results are combined (`All` = AND, `Any` = OR).
     pub op: CombineOp,
-    /// The ordered list of checks that `evaluate` will run.
+    /// The ordered list of checks that evaluation will run.
     pub checks: Vec<CheckKind>,
+    /// The configured maximum number of checks for this policy.
+    pub max_checks: u32,
+    /// Monotonic version of this policy.
+    pub policy_version: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -455,14 +497,135 @@ impl PolicyEngine {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::CombineOp, &op);
+        let default_name = Symbol::new(&env, "default");
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultPolicy, &default_name);
         let empty: Vec<CheckKind> = Vec::new(&env);
-        env.storage().instance().set(&DataKey::Checks, &empty);
+        let policy = Policy {
+            admin: admin.clone(),
+            op,
+            checks: empty,
+            max_checks: MAX_CHECKS,
+            policy_version: 1,
+        };
+        let mut policies: Map<Symbol, Policy> = Map::new(&env);
+        policies.set(default_name, policy);
+        env.storage().instance().set(&DataKey::Policies, &policies);
         if let Some(breaker) = circuit_breaker {
             env.storage()
                 .instance()
                 .set(&DataKey::CircuitBreaker, &breaker);
         }
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Create a new named policy managed by `admin`. Admin-only (the
+    /// contract-level admin). Fails if a policy with `name` already exists.
+    pub fn create_policy(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        op: CombineOp,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let mut policies: Map<Symbol, Policy> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Policies)
+            .ok_or(Error::NotInitialized)?;
+        if policies.contains_key(name.clone()) {
+            return Err(Error::PolicyAlreadyExists);
+        }
+        let empty: Vec<CheckKind> = Vec::new(&env);
+        policies.set(
+            name,
+            Policy {
+                admin,
+                op,
+                checks: empty,
+                max_checks: MAX_CHECKS,
+                policy_version: 1,
+            },
+        );
+        env.storage().instance().set(&DataKey::Policies, &policies);
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Reassign the admin of a named policy. Only the current policy admin
+    /// (or the contract admin) may call this.
+    pub fn set_policy_admin(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_policy_admin(&env, &name, &admin)?;
+        let mut policies: Map<Symbol, Policy> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Policies)
+            .ok_or(Error::NotInitialized)?;
+        let mut policy = policies.get(name.clone()).ok_or(Error::PolicyNotFound)?;
+        policy.admin = new_admin;
+        policy.policy_version = policy.policy_version.saturating_add(1);
+        policies.set(name, policy);
+        env.storage().instance().set(&DataKey::Policies, &policies);
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Remove a named policy. Admin-only. The default policy cannot be
+    /// removed.
+    pub fn remove_policy(env: Env, admin: Address, name: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let default_name: Symbol = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultPolicy)
+            .ok_or(Error::NotInitialized)?;
+        if name == default_name {
+            return Err(Error::NotAuthorized);
+        }
+        let mut policies: Map<Symbol, Policy> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Policies)
+            .ok_or(Error::NotInitialized)?;
+        if !policies.contains_key(name.clone()) {
+            return Err(Error::PolicyNotFound);
+        }
+        policies.remove(name);
+        env.storage().instance().set(&DataKey::Policies, &policies);
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Set the maximum number of checks allowed for a named policy.
+    /// Admin-only for that policy. Rejects values above
+    /// [`MAX_CHECKS_HARD_LIMIT`].
+    pub fn set_max_checks(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        max_checks: u32,
+    ) -> Result<(), Error> {
+        Self::require_policy_admin(&env, &name, &admin)?;
+        if max_checks > MAX_CHECKS_HARD_LIMIT {
+            return Err(Error::MaxChecksTooHigh);
+        }
+        let mut policies: Map<Symbol, Policy> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Policies)
+            .ok_or(Error::NotInitialized)?;
+        let mut policy = policies.get(name.clone()).ok_or(Error::PolicyNotFound)?;
+        policy.max_checks = max_checks;
+        policy.policy_version = policy.policy_version.saturating_add(1);
+        policies.set(name, policy);
+        env.storage().instance().set(&DataKey::Policies, &policies);
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -539,18 +702,32 @@ impl PolicyEngine {
     /// `MAX_CHECKS` entries. This keeps the number of cross-contract calls
     /// issued by `evaluate` bounded and prevents storage bloat.
     pub fn add_check(env: Env, admin: Address, check: CheckKind) -> Result<(), Error> {
+        let name = Self::default_policy_name(&env)?;
+        Self::add_check_to_policy(env, admin, name, check)
+    }
+
+    /// Append a new `check` to a named policy. Admin-only for that policy.
+    pub fn add_check_to_policy(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        check: CheckKind,
+    ) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
-        Self::require_admin(&env, &admin)?;
-        let mut checks: Vec<CheckKind> = env
+        Self::require_policy_admin(&env, &name, &admin)?;
+        let mut policies: Map<Symbol, Policy> = env
             .storage()
             .instance()
-            .get(&DataKey::Checks)
+            .get(&DataKey::Policies)
             .ok_or(Error::NotInitialized)?;
-        if checks.len() >= MAX_CHECKS {
+        let mut policy = policies.get(name.clone()).ok_or(Error::PolicyNotFound)?;
+        if policy.checks.len() >= policy.max_checks {
             return Err(Error::MaxDepthExceeded);
         }
-        checks.push_back(check);
-        env.storage().instance().set(&DataKey::Checks, &checks);
+        policy.checks.push_back(check);
+        policy.policy_version = policy.policy_version.saturating_add(1);
+        policies.set(name, policy);
+        env.storage().instance().set(&DataKey::Policies, &policies);
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -558,18 +735,33 @@ impl PolicyEngine {
     /// Remove the check at position `index` from the policy list.
     /// Admin-only. Indices shift down after removal (Vec::remove semantics).
     pub fn remove_check(env: Env, admin: Address, index: u32) -> Result<(), Error> {
+        let name = Self::default_policy_name(&env)?;
+        Self::remove_check_from_policy(env, admin, name, index)
+    }
+
+    /// Remove the check at position `index` from a named policy.
+    /// Admin-only for that policy.
+    pub fn remove_check_from_policy(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        index: u32,
+    ) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
-        Self::require_admin(&env, &admin)?;
-        let mut checks: Vec<CheckKind> = env
+        Self::require_policy_admin(&env, &name, &admin)?;
+        let mut policies: Map<Symbol, Policy> = env
             .storage()
             .instance()
-            .get(&DataKey::Checks)
+            .get(&DataKey::Policies)
             .ok_or(Error::NotInitialized)?;
-        if index >= checks.len() {
+        let mut policy = policies.get(name.clone()).ok_or(Error::PolicyNotFound)?;
+        if index >= policy.checks.len() {
             return Err(Error::IndexOutOfBounds);
         }
-        checks.remove(index);
-        env.storage().instance().set(&DataKey::Checks, &checks);
+        policy.checks.remove(index);
+        policy.policy_version = policy.policy_version.saturating_add(1);
+        policies.set(name, policy);
+        env.storage().instance().set(&DataKey::Policies, &policies);
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -585,33 +777,68 @@ impl PolicyEngine {
     /// Returns `Err(Error::IndexOutOfBounds)` if either index is out of range.
     /// No-ops if `i == j`.
     pub fn swap_checks(env: Env, admin: Address, i: u32, j: u32) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
+        let name = Self::default_policy_name(&env)?;
+        Self::swap_checks_in_policy(env, admin, name, i, j)
+    }
+
+    /// Swap the checks at positions `i` and `j` in a named policy.
+    /// Admin-only for that policy.
+    pub fn swap_checks_in_policy(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        i: u32,
+        j: u32,
+    ) -> Result<(), Error> {
+        Self::require_policy_admin(&env, &name, &admin)?;
         if i == j {
             return Ok(());
         }
-        let mut checks: Vec<CheckKind> = env
+        let mut policies: Map<Symbol, Policy> = env
             .storage()
             .instance()
-            .get(&DataKey::Checks)
+            .get(&DataKey::Policies)
             .ok_or(Error::NotInitialized)?;
-        let len = checks.len();
+        let mut policy = policies.get(name.clone()).ok_or(Error::PolicyNotFound)?;
+        let len = policy.checks.len();
         if i >= len || j >= len {
             return Err(Error::IndexOutOfBounds);
         }
-        let check_i = checks.get(i).unwrap();
-        let check_j = checks.get(j).unwrap();
-        checks.set(i, check_j);
-        checks.set(j, check_i);
-        env.storage().instance().set(&DataKey::Checks, &checks);
+        let check_i = policy.checks.get(i).unwrap();
+        let check_j = policy.checks.get(j).unwrap();
+        policy.checks.set(i, check_j);
+        policy.checks.set(j, check_i);
+        policy.policy_version = policy.policy_version.saturating_add(1);
+        policies.set(name, policy);
+        env.storage().instance().set(&DataKey::Policies, &policies);
         Ok(())
     }
 
     /// Remove every configured check in one call. Admin-only.
     pub fn clear_checks(env: Env, admin: Address) -> Result<(), Error> {
+        let name = Self::default_policy_name(&env)?;
+        Self::clear_checks_in_policy(env, admin, name)
+    }
+
+    /// Remove every configured check from a named policy. Admin-only for
+    /// that policy.
+    pub fn clear_checks_in_policy(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+    ) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
-        Self::require_admin(&env, &admin)?;
-        let empty: Vec<CheckKind> = Vec::new(&env);
-        env.storage().instance().set(&DataKey::Checks, &empty);
+        Self::require_policy_admin(&env, &name, &admin)?;
+        let mut policies: Map<Symbol, Policy> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Policies)
+            .ok_or(Error::NotInitialized)?;
+        let mut policy = policies.get(name.clone()).ok_or(Error::PolicyNotFound)?;
+        policy.checks = Vec::new(&env);
+        policy.policy_version = policy.policy_version.saturating_add(1);
+        policies.set(name, policy);
+        env.storage().instance().set(&DataKey::Policies, &policies);
         Ok(())
     }
 
@@ -628,17 +855,31 @@ impl PolicyEngine {
     /// on-chain regardless of the result. `Err` is returned only for
     /// configuration failures (e.g. the contract was never initialized).
     pub fn evaluate(env: Env, from: Address, to: Address) -> Result<bool, Error> {
-        let checks: Vec<CheckKind> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Checks)
-            .ok_or(Error::NotInitialized)?;
-        let op: CombineOp = env
-            .storage()
-            .instance()
-            .get(&DataKey::CombineOp)
-            .ok_or(Error::NotInitialized)?;
-        let (passed, _) = Self::evaluate_inner(&env, &checks, &op, &from, &to);
+        let name = Self::default_policy_name(&env)?;
+        let policy = Self::load_policy(&env, &name)?;
+        let (passed, _) = Self::evaluate_inner(&env, &name, &policy, &from, &to, None);
+        Ok(passed)
+    }
+
+    /// Evaluate a named policy against a single `address` (e.g. the sender of
+    /// a transfer). Returns `Ok(true)` if the policy passes.
+    pub fn evaluate_policy(env: Env, name: Symbol, address: Address) -> Result<bool, Error> {
+        let policy = Self::load_policy(&env, &name)?;
+        let (passed, _) = Self::evaluate_inner(&env, &name, &policy, &address, &address, None);
+        Ok(passed)
+    }
+
+    /// Evaluate a named policy against a single `address`, forwarding an
+    /// optional transfer `amount` to amount-aware checks.
+    pub fn evaluate_with_amount(
+        env: Env,
+        name: Symbol,
+        address: Address,
+        amount: Option<i128>,
+    ) -> Result<bool, Error> {
+        let policy = Self::load_policy(&env, &name)?;
+        let (passed, _) =
+            Self::evaluate_inner(&env, &name, &policy, &address, &address, amount);
         Ok(passed)
     }
 
@@ -646,19 +887,12 @@ impl PolicyEngine {
     ///
     /// Returns a `Vec<bool>` containing the pass/fail status for each pair in the same order.
     pub fn batch_evaluate(env: Env, pairs: Vec<AddressPair>) -> Result<Vec<bool>, Error> {
-        let checks: Vec<CheckKind> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Checks)
-            .ok_or(Error::NotInitialized)?;
-        let op: CombineOp = env
-            .storage()
-            .instance()
-            .get(&DataKey::CombineOp)
-            .ok_or(Error::NotInitialized)?;
+        let name = Self::default_policy_name(&env)?;
+        let policy = Self::load_policy(&env, &name)?;
         let mut results = Vec::new(&env);
         for pair in pairs.iter() {
-            let (passed, _) = Self::evaluate_inner(&env, &checks, &op, &pair.from, &pair.to);
+            let (passed, _) =
+                Self::evaluate_inner(&env, &name, &policy, &pair.from, &pair.to, None);
             results.push_back(passed);
         }
         Ok(results)
@@ -687,26 +921,19 @@ impl PolicyEngine {
         from: Address,
         to: Address,
     ) -> Result<(bool, Option<CheckFailure>), Error> {
-        let checks: Vec<CheckKind> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Checks)
-            .ok_or(Error::NotInitialized)?;
-        let op: CombineOp = env
-            .storage()
-            .instance()
-            .get(&DataKey::CombineOp)
-            .ok_or(Error::NotInitialized)?;
-        let result = Self::evaluate_inner(&env, &checks, &op, &from, &to);
+        let name = Self::default_policy_name(&env)?;
+        let policy = Self::load_policy(&env, &name)?;
+        let result = Self::evaluate_inner(&env, &name, &policy, &from, &to, None);
         Ok(result)
     }
 
     fn evaluate_inner(
         env: &Env,
-        checks: &Vec<CheckKind>,
-        op: &CombineOp,
+        name: &Symbol,
+        policy: &Policy,
         from: &Address,
         to: &Address,
+        amount: Option<i128>,
     ) -> (bool, Option<CheckFailure>) {
         let breaker_addr: Option<Address> = env
             .storage()
@@ -718,18 +945,23 @@ impl PolicyEngine {
                     passed: false,
                     from: from.clone(),
                     to: to.clone(),
+                    policy_name: name.clone(),
+                    policy_version: policy.policy_version,
                 }
                 .publish(env);
                 return (false, None);
             }
         }
 
-        let result = match op {
+        let checks = &policy.checks;
+        let result = match policy.op {
             CombineOp::All => {
                 let mut result = (true, None);
                 for i in 0..checks.len() {
                     let check = checks.get(i).unwrap();
-                    if !Self::run_check(env, &check, from) || !Self::run_check(env, &check, to) {
+                    if !Self::run_check(env, &check, from, amount)
+                        || !Self::run_check(env, &check, to, amount)
+                    {
                         result = (
                             false,
                             Some(CheckFailure {
@@ -749,7 +981,9 @@ impl PolicyEngine {
                     let mut any_pass = false;
                     for i in 0..checks.len() {
                         let check = checks.get(i).unwrap();
-                        if Self::run_check(env, &check, from) && Self::run_check(env, &check, to) {
+                        if Self::run_check(env, &check, from, amount)
+                            && Self::run_check(env, &check, to, amount)
+                        {
                             any_pass = true;
                             break;
                         }
@@ -776,6 +1010,8 @@ impl PolicyEngine {
             passed: result.0,
             from: from.clone(),
             to: to.clone(),
+            policy_name: name.clone(),
+            policy_version: policy.policy_version,
         }
         .publish(env);
         result
@@ -794,12 +1030,9 @@ impl PolicyEngine {
     /// `Vec<CheckKind>` — especially important as the list grows toward
     /// `MAX_CHECKS`.
     pub fn get_check(env: Env, index: u32) -> Result<CheckKind, Error> {
-        let checks: Vec<CheckKind> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Checks)
-            .ok_or(Error::NotInitialized)?;
-        checks.get(index).ok_or(Error::CheckIndexOutOfRange)
+        let name = Self::default_policy_name(&env)?;
+        let policy = Self::load_policy(&env, &name)?;
+        policy.checks.get(index).ok_or(Error::CheckIndexOutOfRange)
     }
 
     /// Returns the current admin address, or `Err(Error::NotInitialized)` if
@@ -817,18 +1050,20 @@ impl PolicyEngine {
 
     /// Returns the current list of registered checks.
     pub fn get_checks(env: Env) -> Vec<CheckKind> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Checks)
-            .unwrap_or_else(|| Vec::new(&env))
+        match Self::default_policy_name(&env) {
+            Ok(name) => match Self::load_policy(&env, &name) {
+                Ok(policy) => policy.checks,
+                Err(_) => Vec::new(&env),
+            },
+            Err(_) => Vec::new(&env),
+        }
     }
 
-    /// Returns the current combination operator.
+    /// Returns the current combination operator of the default policy.
     pub fn get_op(env: Env) -> Result<CombineOp, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::CombineOp)
-            .ok_or(Error::NotInitialized)
+        let name = Self::default_policy_name(&env)?;
+        let policy = Self::load_policy(&env, &name)?;
+        Ok(policy.op)
     }
 
     /// Returns the full configured policy tree as a [`PolicyNode`].
@@ -840,18 +1075,20 @@ impl PolicyEngine {
     ///
     /// Returns `Err(Error::NotInitialized)` if the contract has not yet been
     /// initialized.
-    pub fn get_policy(env: Env) -> Result<PolicyNode, Error> {
-        let op: CombineOp = env
-            .storage()
-            .instance()
-            .get(&DataKey::CombineOp)
-            .ok_or(Error::NotInitialized)?;
-        let checks: Vec<CheckKind> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Checks)
-            .ok_or(Error::NotInitialized)?;
-        Ok(PolicyNode { op, checks })
+    pub fn get_policy(env: Env, name: Symbol) -> Result<PolicyNode, Error> {
+        let policy = Self::load_policy(&env, &name)?;
+        Ok(PolicyNode {
+            op: policy.op,
+            checks: policy.checks,
+            max_checks: policy.max_checks,
+            policy_version: policy.policy_version,
+        })
+    }
+
+    /// Returns the current version of a named policy.
+    pub fn get_policy_version(env: Env, name: Symbol) -> Result<u32, Error> {
+        let policy = Self::load_policy(&env, &name)?;
+        Ok(policy.policy_version)
     }
 
     // -----------------------------------------------------------------------
