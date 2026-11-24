@@ -433,7 +433,7 @@ fn test_propose_creates_proposal_with_zero_approvals() {
     let proposal_id = client.propose(&payload, &expiry);
 
     assert_eq!(proposal_id, 0u64);
-    let (stored_payload, stored_expiry, approvals) = client.get_proposal(&0);
+    let (stored_payload, stored_expiry, approvals, _) = client.get_proposal(&0);
     assert_eq!(stored_payload, payload);
     assert_eq!(stored_expiry, expiry);
     assert_eq!(approvals.len(), 0);
@@ -479,7 +479,7 @@ fn test_approve_same_signer_twice_returns_already_approved() {
     assert_eq!(result, Err(Ok(Error::AlreadyApproved)));
 
     // Verify only 1 approval is stored.
-    let (_, _, approvals) = client.get_proposal(&proposal_id);
+    let (_, _, approvals, _) = client.get_proposal(&proposal_id);
     assert_eq!(approvals.len(), 1);
 }
 
@@ -747,7 +747,7 @@ fn test_proposal_writes_refresh_ttl() {
 
     advance_past_threshold(&env);
     client.approve(&proposal_id, &signers.get(1).unwrap());
-    let (_payload, _expiry, approvals) = client.get_proposal(&proposal_id);
+    let (_payload, _expiry, approvals, _) = client.get_proposal(&proposal_id);
     assert_eq!(approvals.len(), 2);
 
     advance_past_threshold(&env);
@@ -839,7 +839,7 @@ fn test_upgrade_preserves_state_and_remains_callable() {
     assert_eq!(stored_signers.len(), 3);
     assert_eq!(stored_signers.get(2).unwrap(), extra_signer);
     assert_eq!(threshold, 2);
-    let (stored_payload, stored_expiry, approvals) = client.get_proposal(&proposal_id);
+    let (stored_payload, stored_expiry, approvals, _) = client.get_proposal(&proposal_id);
     assert_eq!(stored_payload, payload);
     assert_eq!(stored_expiry, expiry);
     assert_eq!(approvals.len(), 1);
@@ -1018,4 +1018,23 @@ fn test_execute_succeeds_when_removed_signer_did_not_approve() {
 
     let result = client.try_get_proposal(&proposal_id);
     assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
+}
+
+// ─── Issue #803: proposal description hash ─────────────────────────────────
+
+#[test]
+fn test_proposal_description_hash_is_stored_and_exposed() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[4u8; 32]);
+    let description = BytesN::from_array(&env, &[9u8; 32]);
+
+    let with_description = client.propose_with_description(&payload, &100, &Some(description.clone()));
+    let (_, _, _, stored) = client.get_proposal(&with_description);
+    assert_eq!(stored, Some(description));
+
+    let without_description = client.propose(&payload, &100);
+    let (_, _, _, stored) = client.get_proposal(&without_description);
+    assert_eq!(stored, None);
 }
