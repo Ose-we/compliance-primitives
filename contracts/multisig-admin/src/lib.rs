@@ -273,6 +273,38 @@ enum DataKey {
     Proposal(u64),
     /// `u64` — the next proposal ID to assign.
     NextProposalId,
+    /// `Vec<u64>` — IDs of proposals that are still open (#802).
+    OpenProposals,
+}
+
+/// IDs of proposals that have not yet been executed, cancelled or expired.
+fn open_proposals(env: &Env) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::OpenProposals)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn remove_open_proposal(env: &Env, proposal_id: u64) {
+    let ids = open_proposals(env);
+    let mut remaining = Vec::new(env);
+    let mut changed = false;
+    for id in ids.iter() {
+        if id == proposal_id {
+            changed = true;
+        } else {
+            remaining.push_back(id);
+        }
+    }
+    if changed {
+        if remaining.is_empty() {
+            env.storage().instance().remove(&DataKey::OpenProposals);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::OpenProposals, &remaining);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +603,9 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .set(&DataKey::NextProposalId, &(proposal_id + 1));
+        let mut open = open_proposals(&env);
+        open.push_back(proposal_id);
+        env.storage().instance().set(&DataKey::OpenProposals, &open);
         extend_instance_ttl(&env);
 
         ProposalCreated {
@@ -700,6 +735,7 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .remove(&DataKey::Proposal(proposal_id));
+        remove_open_proposal(&env, proposal_id);
         extend_instance_ttl(&env);
 
         // Emit an on-chain event so off-chain indexers can track which
@@ -708,6 +744,76 @@ impl MultisigAdmin {
             .publish((soroban_sdk::symbol_short!("PropExec"),), proposal_id);
 
         Ok(())
+    }
+
+    /// Cancel a pending proposal. Only a current signer may cancel, and the
+    /// proposal is removed from both storage and the open-proposal index (#802).
+    pub fn cancel_proposal(env: Env, proposal_id: u64, signer: Address) -> Result<(), Error> {
+        signer.require_auth();
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
+        if !signers.contains(signer) {
+            return Err(Error::NotASigner);
+        }
+        if !env.storage().instance().has(&DataKey::Proposal(proposal_id)) {
+            return Err(Error::ProposalNotFound);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::Proposal(proposal_id));
+        remove_open_proposal(&env, proposal_id);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish((soroban_sdk::Symbol::new(&env, "prop_cancel"),), proposal_id);
+        Ok(())
+    }
+
+    /// List open proposal IDs, skipping expired ones and pruning their state.
+    ///
+    /// `start` is an index into the open list and `limit` bounds the page so a
+    /// caller cannot be forced to decode an unbounded vector (#802).
+    pub fn list_proposals(env: Env, start: u32, limit: u32) -> Vec<u64> {
+        let current_ledger = env.ledger().sequence();
+        let ids = open_proposals(&env);
+        let mut kept = Vec::new(&env);
+        let mut result = Vec::new(&env);
+        let mut position: u32 = 0;
+
+        for id in ids.iter() {
+            let proposal: Option<Proposal> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Proposal(id));
+            let live = match proposal {
+                Some(p) if p.expiry > current_ledger => true,
+                _ => {
+                    env.storage().instance().remove(&DataKey::Proposal(id));
+                    false
+                }
+            };
+            if !live {
+                continue;
+            }
+            kept.push_back(id);
+            if position >= start && (limit == 0 || result.len() < limit) {
+                result.push_back(id);
+            }
+            position += 1;
+        }
+
+        if kept.len() != ids.len() {
+            if kept.is_empty() {
+                env.storage().instance().remove(&DataKey::OpenProposals);
+            } else {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::OpenProposals, &kept);
+            }
+        }
+        result
     }
 
     /// Get the details of a proposal (payload, expiry, current approvals).
