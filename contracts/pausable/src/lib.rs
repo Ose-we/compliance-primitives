@@ -85,6 +85,78 @@ enum DataKey {
     /// last paused via [`pause_with_reason`].  Absent when no reason was
     /// supplied or the contract is not paused.
     PauseReason,
+    /// Scopes currently paused independently of the global flag (#805).
+    PausedScopes,
+}
+
+///Feature-level pause scope (#805). A global pause overrides every scope.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseScope {
+    /// Minting / issuance operations.
+    Mint,
+    /// Redemption / withdrawal operations.
+    Redeem,
+    /// Transfers between accounts.
+    Transfer,
+    /// Administrative configuration changes.
+    Admin,
+}
+
+fn active_scopes(env: &Env) -> soroban_sdk::Vec<PauseScope> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PausedScopes)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+/// Pause a single feature while other features remain operational.
+pub fn pause_scope(env: &Env, scope: PauseScope) {
+    let mut scopes = active_scopes(env);
+    if !scopes.contains(scope.clone()) {
+        scopes.push_back(scope);
+        env.storage().instance().set(&DataKey::PausedScopes, &scopes);
+    }
+}
+
+/// Resume a previously paused feature. The global pause is unaffected.
+pub fn unpause_scope(env: &Env, scope: PauseScope) {
+    let scopes = active_scopes(env);
+    let mut remaining = soroban_sdk::Vec::new(env);
+    for current in scopes.iter() {
+        if current != scope {
+            remaining.push_back(current);
+        }
+    }
+    if remaining.is_empty() {
+        env.storage().instance().remove(&DataKey::PausedScopes);
+    } else {
+        env.storage().instance().set(&DataKey::PausedScopes, &remaining);
+    }
+}
+
+/// Returns `true` when the contract is globally paused or `scope` is paused.
+///
+/// A global pause overrides every scope, so callers guarding a specific
+/// feature with [`require_not_paused_scope`] also stop during a full stop.
+pub fn is_paused_scope(env: &Env, scope: PauseScope) -> bool {
+    is_paused(env) || active_scopes(env).contains(scope)
+}
+
+/// Panic if the contract is globally paused or `scope` is paused.
+pub fn require_not_paused_scope(env: &Env, scope: PauseScope) {
+    if is_paused_scope(env, scope) {
+        panic!("contract is paused");
+    }
+}
+
+/// Return `Err(err)` if the contract is globally paused or `scope` is paused.
+pub fn require_not_paused_scope_or<E>(env: &Env, scope: PauseScope, err: E) -> Result<(), E> {
+    if is_paused_scope(env, scope) {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 /// Returns `true` if the contract is currently paused.
@@ -143,6 +215,7 @@ pub fn unpause(env: &Env) {
     env.storage().instance().set(&DataKey::Paused, &false);
     env.storage().instance().remove(&DataKey::PausedSince);
     env.storage().instance().remove(&DataKey::PauseReason);
+    env.storage().instance().remove(&DataKey::PausedScopes);
 }
 
 /// Returns the ledger timestamp (seconds since Unix epoch) at which the
