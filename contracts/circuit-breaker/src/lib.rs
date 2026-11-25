@@ -76,7 +76,7 @@
 //! alongside it and call it after `upgrade`. See `STORAGE_VERSIONING.md`.
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 /// Extend the contract's instance storage when its remaining TTL drops below
@@ -92,8 +92,10 @@ pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200;
 enum DataKey {
     Admin,
     Frozen,
+    FrozenSince,
     PendingAdmin,
     Guardians,
+    AuditLog,
 }
 
 /// Version + admin metadata about this contract instance, for tooling that
@@ -188,13 +190,23 @@ impl CircuitBreaker {
     /// so an incident can be halted even when the admin key is unavailable.
     pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
         Self::require_admin_or_guardian(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Frozen, &true);
+        let currently_frozen: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false);
+        if !currently_frozen {
+            env.storage().instance().set(&DataKey::Frozen, &true);
+            env.storage()
+                .instance()
+                .set(&DataKey::FrozenSince, &env.ledger().sequence());
+        }
         Self::extend_instance_ttl(&env);
         Frozen {
             caller: caller.clone(),
         }
         .publish(&env);
-        Self::record_audit(&env, Symbol::new(&env, "freeze"), &admin, "circuit breaker frozen");
+        Self::record_audit(&env, Symbol::new(&env, "freeze"), &caller, "circuit breaker frozen");
         Ok(())
     }
 
@@ -213,6 +225,7 @@ impl CircuitBreaker {
             return Ok(());
         }
         env.storage().instance().set(&DataKey::Frozen, &false);
+        env.storage().instance().remove(&DataKey::FrozenSince);
         Self::extend_instance_ttl(&env);
         Unfrozen {
             admin: admin.clone(),
@@ -243,6 +256,29 @@ impl CircuitBreaker {
             .instance()
             .get(&DataKey::Frozen)
             .unwrap_or(false))
+    }
+
+    /// Returns the ledger sequence number when the breaker was frozen, or
+    /// `None` if the breaker is not currently frozen.
+    ///
+    /// Returns `Err(Error::NotInitialized)` if the contract has never been
+    /// initialized.
+    pub fn frozen_since(env: Env) -> Result<Option<u32>, Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let currently_frozen: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Frozen)
+            .unwrap_or(false);
+        if !currently_frozen {
+            return Ok(None);
+        }
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::FrozenSince))
     }
 
     /// Returns the current admin address, or `Err(Error::NotInitialized)` if
@@ -415,6 +451,12 @@ impl CircuitBreaker {
             return Err(Error::NotAuthorized);
         }
         Ok(())
+    }
+
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
     }
 
     fn record_audit(env: &Env, kind: Symbol, subject: &Address, detail: &str) {
