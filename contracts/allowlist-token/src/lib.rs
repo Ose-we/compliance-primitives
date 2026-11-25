@@ -126,12 +126,16 @@ pub struct AllowlistEntry {
 pub struct AllowAdd {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 #[contractevent]
 pub struct AllowRemove {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 /// Emitted when an admin or compliance officer freezes `address`.
@@ -402,7 +406,7 @@ impl AllowlistToken {
             ALLOWED_TTL_THRESHOLD,
             ALLOWED_TTL_EXTEND_TO,
         );
-        AllowAdd { address }.publish(&env);
+        AllowAdd { address, by: admin }.publish(&env);
         Ok(())
     }
 
@@ -434,7 +438,7 @@ impl AllowlistToken {
                 ALLOWED_TTL_THRESHOLD,
                 ALLOWED_TTL_EXTEND_TO,
             );
-            AllowAdd { address }.publish(&env);
+            AllowAdd { address, by: admin.clone() }.publish(&env);
         }
         Ok(())
     }
@@ -511,7 +515,7 @@ impl AllowlistToken {
             ALLOWED_TTL_THRESHOLD,
             ALLOWED_TTL_EXTEND_TO,
         );
-        AllowAdd { address }.publish(&env);
+        AllowAdd { address, by: admin }.publish(&env);
         Ok(())
     }
 
@@ -524,7 +528,7 @@ impl AllowlistToken {
         env.storage()
             .persistent()
             .remove(&DataKey::Allowed(address.clone()));
-        AllowRemove { address }.publish(&env);
+        AllowRemove { address, by: admin }.publish(&env);
         Ok(())
     }
 
@@ -547,7 +551,7 @@ impl AllowlistToken {
             env.storage()
                 .persistent()
                 .remove(&DataKey::Allowed(address.clone()));
-            AllowRemove { address }.publish(&env);
+            AllowRemove { address, by: admin.clone() }.publish(&env);
         }
         Ok(())
     }
@@ -1037,7 +1041,12 @@ impl AllowlistToken {
 
     fn is_allowed_and_extend_ttl(env: &Env, address: Address) -> bool {
         let key = DataKey::Allowed(address);
-        let allowed = env.storage().persistent().get(&key).unwrap_or(false);
+        let entry: Option<AllowlistEntry> = env.storage().persistent().get(&key);
+        let allowed = entry.is_some_and(|entry| {
+            entry
+                .expiration_ledger
+                .map_or(true, |exp| env.ledger().sequence() <= exp)
+        });
         if allowed {
             env.storage().persistent().extend_ttl(
                 &key,
@@ -1045,7 +1054,7 @@ impl AllowlistToken {
                 ALLOWED_TTL_EXTEND_TO,
             );
         }
-        Err(Error::NotAuthorized)
+        allowed
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {

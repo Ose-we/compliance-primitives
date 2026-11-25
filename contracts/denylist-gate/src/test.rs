@@ -238,7 +238,7 @@ fn test_remove_from_denylist_never_added_is_noop() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "deny_remove"), never_added.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -268,12 +268,12 @@ fn test_remove_multiple_from_denylist_removes_all_and_emits_events() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "deny_remove"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "deny_remove"), bob.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );

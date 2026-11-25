@@ -91,6 +91,9 @@ pub struct JurisdictionSet {
     #[topic]
     pub address: Address,
     pub code: String,
+    /// Stored codes before this call; empty if none were set. Includes codes
+    /// whose `valid_until` has already passed.
+    pub previous: Vec<String>,
 }
 
 /// Emitted when a read encounters a flag whose `valid_until` has passed.
@@ -400,6 +403,7 @@ impl JurisdictionFlag {
         Self::reject_if_paused(&env)?;
         Self::validate_jurisdiction_code(&code)?;
 
+        let previous = Self::load_jurisdictions(&env, &address);
         let mut codes = Vec::new(&env);
         codes.push_back(code.clone());
         Self::store_jurisdictions(&env, &address, &codes);
@@ -410,6 +414,7 @@ impl JurisdictionFlag {
         JurisdictionSet {
             address,
             code,
+            previous,
         }
         .publish(&env);
         Ok(())
@@ -444,13 +449,14 @@ impl JurisdictionFlag {
         }
 
         for (address, code) in entries.iter() {
+            let previous = Self::load_jurisdictions(&env, &address);
             let mut codes = Vec::new(&env);
             codes.push_back(code.clone());
             Self::store_jurisdictions(&env, &address, &codes);
             env.storage()
                 .persistent()
                 .remove(&DataKey::ValidUntil(address.clone()));
-            JurisdictionSet { address, code }.publish(&env);
+            JurisdictionSet { address, code, previous }.publish(&env);
         }
         Ok(())
     }
@@ -475,6 +481,7 @@ impl JurisdictionFlag {
             return Err(Error::InvalidInput);
         }
 
+        let previous = Self::load_jurisdictions(&env, &address);
         let mut codes = Vec::new(&env);
         codes.push_back(code.clone());
         Self::store_jurisdictions(&env, &address, &codes);
@@ -482,7 +489,7 @@ impl JurisdictionFlag {
         env.storage().persistent().set(&until_key, &valid_until);
         Self::extend_jurisdiction_ttl(&env, &until_key);
 
-        JurisdictionSet { address, code }.publish(&env);
+        JurisdictionSet { address, code, previous }.publish(&env);
         Ok(())
     }
 
@@ -503,7 +510,8 @@ impl JurisdictionFlag {
         Self::reject_if_paused(&env)?;
         Self::validate_jurisdiction_code(&code)?;
 
-        let mut codes = Self::load_jurisdictions(&env, &address);
+        let previous = Self::load_jurisdictions(&env, &address);
+        let mut codes = previous.clone();
         if !codes.iter().any(|existing| existing == code) {
             if codes.len() >= MAX_CODES_PER_ADDRESS {
                 return Err(Error::TooManyCodes);
@@ -512,7 +520,7 @@ impl JurisdictionFlag {
             Self::store_jurisdictions(&env, &address, &codes);
         }
 
-        JurisdictionSet { address, code }.publish(&env);
+        JurisdictionSet { address, code, previous }.publish(&env);
         Ok(())
     }
 

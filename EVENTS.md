@@ -81,12 +81,13 @@ Emitted when an address is added to the allowlist.
 
 ```
 topics : ["allow_add", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address added to the allowlist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `AllowRemove`
 
@@ -96,12 +97,13 @@ removal is a no-op but the event is still emitted for auditability.
 
 ```
 topics : ["allow_remove", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address removed from the allowlist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `AddressFrozen`
 
@@ -246,12 +248,13 @@ address in a batch `add_multiple_to_denylist` call.
 
 ```
 topics : ["deny_add", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address added to the denylist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `DenyRemove`
 
@@ -261,12 +264,13 @@ removal is a no-op but the event is still emitted for auditability.
 
 ```
 topics : ["deny_remove", <address: Address>]
-data   : {}
+data   : { "by": <Address> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address removed from the denylist |
+| `by` | `Address` | data | Admin or compliance officer that authorized the change |
 
 #### `AdminTransferred`
 
@@ -379,13 +383,14 @@ one was already set).
 
 ```
 topics : ["jurisdiction_set", <address: Address>]
-data   : { "code": <String> }
+data   : { "code": <String>, "previous": <Vec<String>> }
 ```
 
 | Field | Type | Placement | Description |
 |---|---|---|---|
 | `address` | `Address` | topic | Address whose jurisdiction was set |
 | `code` | `String` | data | ISO 3166-1 alpha-2 (or similar) jurisdiction code |
+| `previous` | `Vec<String>` | data | Stored codes before the call (empty if none) |
 
 > **Note — payload in data**: unlike `DenyAdd`/`AllowAdd` where the topic
 > address is the entire meaningful payload, `JurisdictionSet` carries a

@@ -181,12 +181,16 @@ pub trait AuditLogInterface {
 pub struct DenyAdd {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 #[contractevent]
 pub struct DenyRemove {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 /// Emitted when the optional audit-log write fails (paused, archived, or
@@ -647,6 +651,7 @@ impl DenylistGate {
 
         DenyAdd {
             address: address.clone(),
+            by: admin,
         }
         .publish(&env);
         Self::record_audit(&env, Symbol::new(&env, "deny_add"), &address, "address added to denylist");
@@ -662,6 +667,7 @@ impl DenylistGate {
             .remove(&DataKey::Denied(address.clone()));
         DenyRemove {
             address: address.clone(),
+            by: admin,
         }
         .publish(&env);
         Self::record_audit(&env, Symbol::new(&env, "deny_remove"), &address, "address removed from denylist");
@@ -684,7 +690,7 @@ impl DenylistGate {
             env.storage()
                 .persistent()
                 .remove(&DataKey::Denied(address.clone()));
-            DenyRemove { address }.publish(&env);
+            DenyRemove { address, by: admin.clone() }.publish(&env);
         }
         Ok(())
     }
