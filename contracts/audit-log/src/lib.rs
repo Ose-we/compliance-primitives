@@ -343,6 +343,18 @@ impl AuditLog {
     /// pass its own address as `source` and Soroban's auth framework will
     /// verify the invocation). This ensures entries cannot be forged by an
     /// address other than the one claiming to be the source.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Called by a consumer contract, which passes its own address as `source`.
+    /// audit_log.record(
+    ///     &consumer,
+    ///     &symbol_short!("freeze"),
+    ///     &subject,
+    ///     &String::from_str(&env, "breaker tripped"),
+    /// );
+    /// ```
     pub fn record(
         env: Env,
         source: Address,

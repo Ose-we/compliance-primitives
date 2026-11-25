@@ -536,6 +536,16 @@ impl MultisigAdmin {
     /// The proposal expires at `expiry_ledger`.
     ///
     /// Emits `ProposalCreated { id, expiry, payload_hash }`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `multisig` is a `MultisigAdminClient`; signers approve until the threshold is met.
+    /// let id = multisig.propose(&payload, &expiry_ledger);
+    /// multisig.approve(&id, &signer_a);
+    /// multisig.approve(&id, &signer_b);
+    /// multisig.execute(&id);
+    /// ```
     pub fn propose(
         env: Env,
         payload: soroban_sdk::Bytes,

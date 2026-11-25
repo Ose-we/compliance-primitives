@@ -381,6 +381,15 @@ impl AllowlistToken {
     /// it is restricted to the `admin` (directly, or through
     /// `add_to_allowlist_delegated`). The compliance officer may revoke access
     /// via `remove_from_allowlist` but never grant it.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `token` is an `AllowlistTokenClient` for the deployed contract.
+    /// // Grant `alice` access until ledger `expiry`; `None` means no expiry.
+    /// token.add_to_allowlist(&admin, &alice, &Some(expiry));
+    /// token.add_to_allowlist(&admin, &bob, &None);
+    /// ```
     pub fn add_to_allowlist(
         env: Env,
         admin: Address,
