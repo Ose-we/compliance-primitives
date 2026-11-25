@@ -36,6 +36,18 @@ fn setup_multisig(
 }
 
 // ---------------------------------------------------------------------------
+// get_pending_count tests
+// ---------------------------------------------------------------------------
+
+/// A freshly initialised multisig has no open proposals.
+#[test]
+fn test_get_pending_count_starts_at_zero() {
+    let env = Env::default();
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+    assert_eq!(client.get_pending_count(), 0u32);
+}
+
+// ---------------------------------------------------------------------------
 // Basic state tests
 // ---------------------------------------------------------------------------
 
