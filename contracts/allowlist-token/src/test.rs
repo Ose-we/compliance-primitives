@@ -1592,3 +1592,65 @@ fn test_delegated_valid_until_ledger_is_bound_by_signature() {
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
 }
+
+/// End-to-end upgrade harness: deploy a real previous-release WASM, write
+/// state, replace the code with HEAD, and verify state remains readable.
+///
+/// Run through `scripts/test-migration.sh`, or set PREVIOUS_ALLOWLIST_WASM
+/// and HEAD_ALLOWLIST_WASM explicitly.
+#[test]
+fn test_previous_release_wasm_upgrade_preserves_state() {
+    let previous_path = std::env::var("PREVIOUS_ALLOWLIST_WASM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("PREVIOUS_WASM_DIR")
+                .map(|dir| PathBuf::from(dir).join("allowlist_token.wasm"))
+                .unwrap_or_default()
+        });
+    let head_path = std::env::var("HEAD_ALLOWLIST_WASM")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+
+    let previous = match std::fs::read(&previous_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "skipping migration test: previous WASM not configured ({:?}: {})",
+                previous_path, error
+            );
+            return;
+        }
+    };
+    let head = match std::fs::read(&head_path) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("HEAD WASM not found at {:?}: {}", head_path, error),
+    };
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(previous.as_slice(), ());
+    let client = AllowlistTokenClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &token);
+    let alice = Address::generate(&env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    assert!(client.is_allowed(&alice));
+
+    let head_hash = env
+        .deployer()
+        .upload_contract_wasm(Bytes::from_slice(&env, &head));
+    env.as_contract(&contract_id, || {
+        env.deployer().update_current_contract_wasm(head_hash);
+    });
+
+    let metadata = client.metadata().unwrap();
+    assert_eq!(metadata.admin, admin);
+    assert!(client.is_allowed(&alice));
+
+    let bob = Address::generate(&env);
+    client.add_to_allowlist(&admin, &bob, &None);
+    assert!(client.is_allowed(&bob));
+}

@@ -4,7 +4,9 @@
   "version": "1.0.0",
   "description": "Node tooling for this repo — currently just the automated accessibility audit of web/index.html. The site itself (web/) is plain HTML/CSS with no JS dependencies.",
   "scripts": {
-    "check-accessibility": "node scripts/check-accessibility.mjs"
+    "check-accessibility": "node scripts/check-accessibility.mjs",
+    "compliance-cli": "node tools/compliance-cli",
+    "test-compliance-cli": "node --test tools/compliance-cli.test.js"
   },
   "devDependencies": {
     "axe-core": "^4.13.0",
