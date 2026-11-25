@@ -231,6 +231,69 @@ pub struct ProposalApproved {
     pub approvals: u32,
 }
 
+/// Emitted when a signer revokes their approval from a proposal.
+///
+/// topics : [Symbol("proposal_unapproved"), u64(id), Address(signer)]
+/// data   : { approvals: u32 }
+#[contractevent]
+pub struct ProposalUnapproved {
+    #[topic]
+    pub id: u64,
+    #[topic]
+    pub signer: Address,
+    pub approvals: u32,
+}
+
+/// Emitted when a pending proposal is cancelled by a signer.
+///
+/// topics : [Symbol("proposal_cancelled"), u64(id), Address(signer)]
+/// data   : {}
+#[contractevent]
+pub struct ProposalCancelled {
+    #[topic]
+    pub id: u64,
+    #[topic]
+    pub signer: Address,
+}
+
+/// Emitted when a proposal is executed.
+///
+/// topics : [Symbol("ProposalExecuted")]
+/// data   : { proposal_id: u64 }
+#[contractevent]
+pub struct ProposalExecuted {
+    pub proposal_id: u64,
+}
+
+/// Emitted when the execution delay timelock is updated.
+///
+/// topics : [Symbol("ExecutionDelaySet")]
+/// data   : { delay: u32 }
+#[contractevent]
+pub struct ExecutionDelaySet {
+    pub delay: u32,
+}
+
+/// Emitted when a signer's weight is updated.
+///
+/// topics : [Symbol("SignerWeightSet"), Address(signer)]
+/// data   : { weight: u32 }
+#[contractevent]
+pub struct SignerWeightSet {
+    #[topic]
+    pub signer: Address,
+    pub weight: u32,
+}
+
+/// Emitted when existing equal-weighted signers are migrated to explicit weights.
+///
+/// topics : [Symbol("MigratedToWeighted")]
+/// data   : { total_weight: u32 }
+#[contractevent]
+pub struct MigratedToWeighted {
+    pub total_weight: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Storage
 // ---------------------------------------------------------------------------
@@ -260,6 +323,8 @@ struct Proposal {
     pub expiry: u32,
     /// Addresses that have approved this proposal.
     pub approvals: Vec<Address>,
+    /// Ledger sequence at which execution timelock expires (0 if threshold not reached or no delay).
+    pub eta: u32,
 }
 
 #[contracttype]
@@ -267,12 +332,16 @@ struct Proposal {
 enum DataKey {
     /// `Vec<Address>` — the current signer set.
     Signers,
-    /// `u32` — minimum number of signers required to authorize.
+    /// `u32` — minimum weight required to authorize.
     Threshold,
     /// `Proposal` — a pending proposal keyed by its ID.
     Proposal(u64),
     /// `u64` — the next proposal ID to assign.
     NextProposalId,
+    /// `u32` — delay in ledgers required between reaching threshold and execution.
+    ExecutionDelay,
+    /// `u32` — weight of a specific signer (keyed by Address).
+    SignerWeight(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +382,14 @@ pub enum Error {
     NotASigner = 12,
     /// The signer has already approved this proposal.
     AlreadyApproved = 13,
+    /// The signer has not approved this proposal.
+    NotApproved = 14,
+    /// Execution timelock delay has not yet passed.
+    TimelockNotMet = 15,
+    /// Signer weight is invalid (must be >= 1).
+    InvalidWeight = 16,
+    /// Number of signers does not match number of weights.
+    WeightsMismatch = 17,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +438,206 @@ impl MultisigAdmin {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+
+        // Initialize default weight of 1 for all signers
+        for i in 0..signers.len() {
+            let signer = signers.get(i).unwrap();
+            env.storage()
+                .instance()
+                .set(&DataKey::SignerWeight(signer), &1u32);
+        }
+
         extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// One-time setup with custom signer weights. `signers` is the initial signer set;
+    /// `weights` is the corresponding weight for each signer; `threshold` is the minimum
+    /// total weight required to authorize.
+    pub fn initialize_with_weights(
+        env: Env,
+        signers: Vec<Address>,
+        weights: Vec<u32>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::AlreadyInitialized);
+        }
+
+        if signers.len() != weights.len() {
+            return Err(Error::WeightsMismatch);
+        }
+
+        for i in 0..signers.len() {
+            let addr_i = signers.get(i).unwrap();
+            for j in (i + 1)..signers.len() {
+                if signers.get(j).unwrap() == addr_i {
+                    return Err(Error::DuplicateSigner);
+                }
+            }
+        }
+
+        let mut total_weight: u32 = 0;
+        for i in 0..weights.len() {
+            let w = weights.get(i).unwrap();
+            if w == 0 {
+                return Err(Error::InvalidWeight);
+            }
+            total_weight = total_weight.saturating_add(w);
+        }
+
+        if threshold == 0 || threshold > total_weight {
+            return Err(Error::InvalidThreshold);
+        }
+
+        env.storage().instance().set(&DataKey::Signers, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &threshold);
+
+        for i in 0..signers.len() {
+            let signer = signers.get(i).unwrap();
+            let weight = weights.get(i).unwrap();
+            env.storage()
+                .instance()
+                .set(&DataKey::SignerWeight(signer), &weight);
+        }
+
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Set an execution delay (in ledgers) between reaching threshold and execution.
+    /// Requires current multisig threshold.
+    pub fn set_execution_delay(env: Env, delay: u32) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        env.current_contract_address().require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ExecutionDelay, &delay);
+        extend_instance_ttl(&env);
+        ExecutionDelaySet { delay }.publish(&env);
+        Ok(())
+    }
+
+    /// Return the execution delay (in ledgers), or 0 if none is configured.
+    pub fn get_execution_delay(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ExecutionDelay)
+            .unwrap_or(0)
+    }
+
+    /// Set the weight of a specific signer. Requires current multisig threshold.
+    pub fn set_signer_weight(env: Env, signer: Address, weight: u32) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        env.current_contract_address().require_auth();
+
+        if weight == 0 {
+            return Err(Error::InvalidWeight);
+        }
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
+
+        let mut is_signer = false;
+        for i in 0..signers.len() {
+            if signers.get(i).unwrap() == signer {
+                is_signer = true;
+                break;
+            }
+        }
+        if !is_signer {
+            return Err(Error::SignerNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerWeight(signer.clone()), &weight);
+        extend_instance_ttl(&env);
+
+        let total_weight = Self::get_total_weight(env.clone());
+        let threshold = Self::get_threshold(env.clone());
+        if total_weight < threshold {
+            return Err(Error::InvalidThreshold);
+        }
+
+        SignerWeightSet { signer, weight }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns the weight of a specific signer (defaults to 1 if signer is in set, 0 if not).
+    pub fn get_signer_weight(env: Env, signer: Address) -> u32 {
+        let signers: Vec<Address> = match env.storage().instance().get(&DataKey::Signers) {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        let mut is_signer = false;
+        for i in 0..signers.len() {
+            if signers.get(i).unwrap() == signer {
+                is_signer = true;
+                break;
+            }
+        }
+        if !is_signer {
+            return 0;
+        }
+
+        env.storage()
+            .instance()
+            .get(&DataKey::SignerWeight(signer))
+            .unwrap_or(1)
+    }
+
+    /// Returns the total weight of all signers in the current signer set.
+    pub fn get_total_weight(env: Env) -> u32 {
+        let signers: Vec<Address> = match env.storage().instance().get(&DataKey::Signers) {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        let mut total: u32 = 0;
+        for i in 0..signers.len() {
+            let signer = signers.get(i).unwrap();
+            let weight = env
+                .storage()
+                .instance()
+                .get(&DataKey::SignerWeight(signer))
+                .unwrap_or(1);
+            total = total.saturating_add(weight);
+        }
+        total
+    }
+
+    /// Explicitly migrates existing equal-weighted signers by writing weight 1 for each signer.
+    /// Requires current multisig threshold.
+    pub fn migrate_to_weighted(env: Env) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        env.current_contract_address().require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
+
+        for i in 0..signers.len() {
+            let signer = signers.get(i).unwrap();
+            if !env.storage().instance().has(&DataKey::SignerWeight(signer.clone())) {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::SignerWeight(signer), &1u32);
+            }
+        }
+
+        extend_instance_ttl(&env);
+        let total_weight = Self::get_total_weight(env.clone());
+        MigratedToWeighted { total_weight }.publish(&env);
         Ok(())
     }
 
@@ -431,13 +707,19 @@ impl MultisigAdmin {
 
         signers.push_back(new_signer.clone());
         env.storage().instance().set(&DataKey::Signers, &signers);
+        // Default weight is 1 if not previously configured
+        if !env.storage().instance().has(&DataKey::SignerWeight(new_signer.clone())) {
+            env.storage()
+                .instance()
+                .set(&DataKey::SignerWeight(new_signer.clone()), &1u32);
+        }
         extend_instance_ttl(&env);
         SignerAdded { signer: new_signer }.publish(&env);
         Ok(())
     }
 
     /// Remove `signer` from the signer set. Requires the current M-of-N
-    /// threshold. The resulting signer count must still be >= threshold.
+    /// threshold. The resulting signer weight must still be >= threshold.
     pub fn remove_signer(env: Env, signer: Address) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         env.current_contract_address().require_auth();
@@ -464,13 +746,17 @@ impl MultisigAdmin {
         let index = found_index.ok_or(Error::SignerNotFound)?;
 
         signers.remove(index);
+        env.storage()
+            .instance()
+            .remove(&DataKey::SignerWeight(signer.clone()));
+        env.storage().instance().set(&DataKey::Signers, &signers);
 
-        // Guard: resulting count must still satisfy the threshold.
-        if (signers.len() as u32) < threshold {
+        // Guard: resulting total weight must still satisfy the threshold.
+        let total_weight = Self::get_total_weight(env.clone());
+        if total_weight < threshold {
             return Err(Error::InvalidThreshold);
         }
 
-        env.storage().instance().set(&DataKey::Signers, &signers);
         extend_instance_ttl(&env);
         SignerRemoved { signer }.publish(&env);
         Ok(())
@@ -481,13 +767,8 @@ impl MultisigAdmin {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         env.current_contract_address().require_auth();
 
-        let signers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Signers)
-            .ok_or(Error::NotInitialized)?;
-
-        if threshold == 0 || threshold as usize > signers.len() as usize {
+        let total_weight = Self::get_total_weight(env.clone());
+        if threshold == 0 || threshold > total_weight {
             return Err(Error::InvalidThreshold);
         }
 
@@ -563,6 +844,7 @@ impl MultisigAdmin {
             payload,
             expiry: expiry_ledger,
             approvals: Vec::new(&env),
+            eta: 0,
         };
 
         env.storage()
@@ -631,6 +913,32 @@ impl MultisigAdmin {
         }
 
         proposal.approvals.push_back(approver.clone());
+
+        // Count approved weight from active signers.
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .ok_or(Error::NotInitialized)?;
+
+        let mut approved_weight: u32 = 0;
+        for i in 0..proposal.approvals.len() {
+            let addr = proposal.approvals.get(i).unwrap();
+            for j in 0..signers.len() {
+                if signers.get(j).unwrap() == addr {
+                    let w = Self::get_signer_weight(env.clone(), addr);
+                    approved_weight = approved_weight.saturating_add(w);
+                    break;
+                }
+            }
+        }
+
+        // If threshold reached and eta is not set yet, set timelock.
+        if approved_weight >= threshold && proposal.eta == 0 {
+            let delay = Self::get_execution_delay(env.clone());
+            proposal.eta = current_ledger + delay;
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -643,17 +951,136 @@ impl MultisigAdmin {
         }
         .publish(&env);
 
+        Ok(approved_weight >= threshold)
+    }
+
+    /// Revoke a signer's earlier approval on a pending proposal.
+    /// Emits `ProposalUnapproved { id, signer, approvals }`.
+    pub fn unapprove(env: Env, signer: Address, proposal_id: u64) -> Result<bool, Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        signer.require_auth();
+        let current_ledger = env.ledger().sequence();
+
+        let mut proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        if current_ledger >= proposal.expiry {
+            return Err(Error::ExpiredProposal);
+        }
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
+
+        // Verify signer is in the current signer set.
+        let mut is_valid_signer = false;
+        for i in 0..signers.len() {
+            if signers.get(i).unwrap() == signer {
+                is_valid_signer = true;
+                break;
+            }
+        }
+        if !is_valid_signer {
+            return Err(Error::NotASigner);
+        }
+
+        // Find and remove approval.
+        let mut found_idx: Option<u32> = None;
+        for i in 0..proposal.approvals.len() {
+            if proposal.approvals.get(i).unwrap() == signer {
+                found_idx = Some(i);
+                break;
+            }
+        }
+        let idx = found_idx.ok_or(Error::NotApproved)?;
+        proposal.approvals.remove(idx);
+
         let threshold: u32 = env
             .storage()
             .instance()
             .get(&DataKey::Threshold)
             .ok_or(Error::NotInitialized)?;
 
-        Ok(proposal.approvals.len() as u32 >= threshold)
+        let mut approved_weight: u32 = 0;
+        for i in 0..proposal.approvals.len() {
+            let addr = proposal.approvals.get(i).unwrap();
+            for j in 0..signers.len() {
+                if signers.get(j).unwrap() == addr {
+                    let w = Self::get_signer_weight(env.clone(), addr);
+                    approved_weight = approved_weight.saturating_add(w);
+                    break;
+                }
+            }
+        }
+
+        // If approval falls below threshold, reset eta.
+        if approved_weight < threshold {
+            proposal.eta = 0;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        extend_instance_ttl(&env);
+
+        ProposalUnapproved {
+            id: proposal_id,
+            signer,
+            approvals: proposal.approvals.len(),
+        }
+        .publish(&env);
+
+        Ok(approved_weight >= threshold)
     }
 
-    /// Execute a proposal. Requires that it has at least `threshold` approvals
-    /// and has not expired. After execution, the proposal is deleted.
+    /// Cancel a pending proposal. May be called by any valid signer.
+    /// Emits `ProposalCancelled { id, signer }`.
+    pub fn cancel(env: Env, signer: Address, proposal_id: u64) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        signer.require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Signers)
+            .ok_or(Error::NotInitialized)?;
+
+        let mut is_valid_signer = false;
+        for i in 0..signers.len() {
+            if signers.get(i).unwrap() == signer {
+                is_valid_signer = true;
+                break;
+            }
+        }
+        if !is_valid_signer {
+            return Err(Error::NotASigner);
+        }
+
+        if !env.storage().instance().has(&DataKey::Proposal(proposal_id)) {
+            return Err(Error::ProposalNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::Proposal(proposal_id));
+        extend_instance_ttl(&env);
+
+        ProposalCancelled {
+            id: proposal_id,
+            signer,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Execute a proposal. Requires that it has at least `threshold` weight,
+    /// has not expired, and any configured execution delay has elapsed.
     pub fn execute(env: Env, proposal_id: u64) -> Result<(), Error> {
         let current_ledger = env.ledger().sequence();
 
@@ -674,27 +1101,31 @@ impl MultisigAdmin {
             .ok_or(Error::NotInitialized)?;
 
         // Count only approvals from addresses still in the current signer set.
-        // If a signer was removed after approving (e.g. compromised key), their
-        // earlier approval must not count toward the threshold.
         let signers: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::Signers)
             .ok_or(Error::NotInitialized)?;
 
-        let mut valid_approval_count: u32 = 0;
+        let mut valid_approval_weight: u32 = 0;
         for i in 0..proposal.approvals.len() {
             let approver = proposal.approvals.get(i).unwrap();
             for j in 0..signers.len() {
                 if signers.get(j).unwrap() == approver {
-                    valid_approval_count += 1;
+                    let w = Self::get_signer_weight(env.clone(), approver);
+                    valid_approval_weight = valid_approval_weight.saturating_add(w);
                     break;
                 }
             }
         }
 
-        if valid_approval_count < threshold {
+        if valid_approval_weight < threshold {
             return Err(Error::ThresholdNotMet);
+        }
+
+        // Verify execution timelock delay has elapsed.
+        if proposal.eta > 0 && current_ledger < proposal.eta {
+            return Err(Error::TimelockNotMet);
         }
 
         env.storage()
@@ -704,8 +1135,7 @@ impl MultisigAdmin {
 
         // Emit an on-chain event so off-chain indexers can track which
         // proposals have been executed and when.
-        env.events()
-            .publish((soroban_sdk::symbol_short!("PropExec"),), proposal_id);
+        ProposalExecuted { proposal_id }.publish(&env);
 
         Ok(())
     }
@@ -722,6 +1152,16 @@ impl MultisigAdmin {
             .ok_or(Error::ProposalNotFound)?;
         Ok((proposal.payload, proposal.expiry, proposal.approvals))
     }
+
+    /// Return the execution timelock ETA ledger sequence for a proposal (0 if not locked).
+    pub fn get_proposal_eta(env: Env, proposal_id: u64) -> Result<u32, Error> {
+        let proposal: Proposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+        Ok(proposal.eta)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,21 +1170,11 @@ impl MultisigAdmin {
 
 impl CustomAccountInterface for MultisigAdmin {
     /// The signature type is a `Vec<Address>` — the list of approving signer
-    /// addresses. The invoker must provide at least `threshold` addresses that
-    /// are all present in the stored signer set. Each address in the list must
-    /// also call `require_auth()` within the same transaction (Soroban's auth
-    /// framework verifies this automatically when the transaction is submitted).
+    /// addresses. The invoker must provide addresses that are all present in
+    /// the stored signer set whose total weight meets or exceeds `threshold`.
     type Signature = Vec<Address>;
     type Error = Error;
 
-    /// Called by the Soroban host whenever something requires auth from this
-    /// contract's address. Counts how many entries in `signatures` appear in
-    /// the stored signer set; if the count meets the threshold, authorization
-    /// succeeds.
-    ///
-    /// `signature_payload` and `auth_context` are provided by the host for
-    /// advanced use-cases (replay prevention, context-specific auth) but are
-    /// not required for this reference implementation.
     #[allow(unused_variables)]
     fn __check_auth(
         env: Env,
@@ -763,9 +1193,7 @@ impl CustomAccountInterface for MultisigAdmin {
             .get(&DataKey::Threshold)
             .ok_or(Error::NotInitialized)?;
 
-        // Reject if the same signer address appears more than once in the
-        // provided signature set — otherwise a single signer's approval
-        // could be duplicated to satisfy the threshold on its own.
+        // Reject if the same signer address appears more than once.
         for i in 0..signatures.len() {
             let addr_i = signatures.get(i).unwrap();
             for j in (i + 1)..signatures.len() {
@@ -775,24 +1203,27 @@ impl CustomAccountInterface for MultisigAdmin {
             }
         }
 
-        let mut valid_count: u32 = 0;
+        let mut valid_weight: u32 = 0;
 
         for i in 0..signatures.len() {
             let sig_addr = signatures.get(i).unwrap();
-            // Each approving address must prove it authorized this call.
             sig_addr.require_auth();
 
-            // Check whether this signer is in the authorized set.
             for j in 0..signers.len() {
                 if signers.get(j).unwrap() == sig_addr {
-                    valid_count += 1;
+                    let weight = Self::get_signer_weight(env.clone(), sig_addr.clone());
+                    valid_weight = valid_weight.saturating_add(weight);
                     break;
                 }
             }
         }
 
-        if valid_count >= threshold {
-            AuthOk { valid_count, threshold }.publish(&env);
+        if valid_weight >= threshold {
+            AuthOk {
+                valid_count: valid_weight,
+                threshold,
+            }
+            .publish(&env);
             Ok(())
         } else {
             Err(Error::ThresholdNotMet)
