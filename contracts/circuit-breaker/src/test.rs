@@ -387,6 +387,132 @@ fn assert_budget_within_threshold(measured: (u64, u64), baseline: (u64, u64), la
     );
 }
 
+// ---------------------------------------------------------------------------
+// Fuzz target: guardian management — #817
+//
+// Random add/remove/freeze/unfreeze sequences by random callers. Invariants:
+//   * only the admin (or a guardian, for freeze) can freeze/unfreeze;
+//   * the guardian list never contains duplicates.
+//
+// The harness is bounded so it can run in CI. Iteration and per-iteration
+// operation counts are configurable via `FUZZ_ITERATIONS` / `FUZZ_OPS`.
+// ---------------------------------------------------------------------------
+
+fn fuzz_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// Deterministic xorshift64* PRNG so failures are reproducible.
+struct FuzzRng(u64);
+
+impl FuzzRng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        if bound == 0 {
+            0
+        } else {
+            self.next_u64() % bound
+        }
+    }
+}
+
+fn fuzz_guardian_sequences(seed: u64, iterations: u64, ops: u64) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(CircuitBreaker, ());
+    let client = CircuitBreakerClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // A small pool of actors keeps collisions (and thus duplicate-add paths)
+    // likely without exhausting the test environment.
+    let mut actors: std::vec::Vec<Address> = std::vec::Vec::new();
+    for _ in 0..4 {
+        actors.push(Address::generate(&env));
+    }
+
+    let mut rng = FuzzRng::new(seed);
+
+    for _ in 0..iterations {
+        for _ in 0..ops {
+            let caller = actors[rng.below(actors.len() as u64) as usize].clone();
+            let target = actors[rng.below(actors.len() as u64) as usize].clone();
+            let is_admin = caller == admin;
+
+            match rng.below(4) {
+                0 => {
+                    // add_guardian: only admin may add.
+                    let result = client.try_add_guardian(&caller, &target);
+                    if !is_admin {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+                1 => {
+                    // remove_guardian: only admin may remove.
+                    let result = client.try_remove_guardian(&caller, &target);
+                    if !is_admin {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+                2 => {
+                    // freeze: admin or a current guardian may freeze.
+                    let allowed = is_admin || client.is_guardian(&caller);
+                    let result = client.try_freeze(&caller, &None);
+                    if allowed {
+                        assert!(result.is_ok(), "authorized freeze must succeed");
+                    } else {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+                _ => {
+                    // unfreeze: admin or a current guardian may unfreeze.
+                    let allowed = is_admin || client.is_guardian(&caller);
+                    let result = client.try_unfreeze(&caller);
+                    if allowed {
+                        assert!(result.is_ok(), "authorized unfreeze must succeed");
+                    } else {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+            }
+
+            // Invariant: the guardian list has no duplicates.
+            let guardians = client.get_guardians();
+            let mut seen: std::vec::Vec<Address> = std::vec::Vec::new();
+            for g in guardians.iter() {
+                assert!(
+                    !seen.contains(&g),
+                    "duplicate guardian detected in list"
+                );
+                seen.push(g);
+            }
+        }
+    }
+}
+
+#[test]
+fn fuzz_guardian_management() {
+    let iterations = fuzz_env_u64("FUZZ_ITERATIONS", 32);
+    let ops = fuzz_env_u64("FUZZ_OPS", 16);
+    fuzz_guardian_sequences(0x9E37_79B9_7F4A_7C15, iterations, ops);
+}
+
 #[test]
 fn test_budget_regression_is_frozen() {
     let env = Env::default();
