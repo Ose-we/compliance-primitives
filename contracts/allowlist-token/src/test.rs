@@ -32,6 +32,91 @@ impl MockToken {
     pub fn last_clawback(env: Env) -> Option<(Address, i128)> {
         env.storage().instance().get(&Symbol::new(&env, "clawback"))
     }
+
+    // ── SEP-41 surface used by the conformance suite ─────────────────────────
+
+    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&allowance_key(&env, &from, &spender))
+            .unwrap_or(0)
+    }
+
+    pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        from.require_auth();
+        env.storage().instance().set(
+            &allowance_key(&env, &from, &spender),
+            &AllowanceData {
+                amount,
+                expiration_ledger,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("approve"), from.clone(), spender.clone()),
+            (amount, expiration_ledger),
+        );
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&balance_key(&env, &id))
+            .unwrap_or(0)
+    }
+
+    pub fn set_balance(env: Env, id: Address, amount: i128) {
+        env.storage().instance().set(&balance_key(&env, &id), &amount);
+    }
+
+    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "last"), &(from.clone(), to.clone(), amount));
+        env.events().publish(
+            (symbol_short!("transfer"), from, to),
+            amount,
+        );
+    }
+
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    pub fn name(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "Mock Token")
+    }
+
+    pub fn symbol(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "MOCK")
+    }
+
+    pub fn total_supply(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "supply"))
+            .unwrap_or(0)
+    }
+
+    pub fn set_total_supply(env: Env, amount: i128) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "supply"), &amount);
+    }
+}
+
+#[derive(Clone)]
+struct AllowanceData {
+    amount: i128,
+    expiration_ledger: u32,
+}
+
+fn allowance_key(env: &Env, from: &Address, spender: &Address) -> (Symbol, Address, Address) {
+    (Symbol::new(env, "allowance"), from.clone(), spender.clone())
+}
+
+fn balance_key(env: &Env, id: &Address) -> (Symbol, Address) {
+    (Symbol::new(env, "balance"), id.clone())
 }
 
 // ─── Setup helper ────────────────────────────────────────────────────────────
@@ -1591,4 +1676,281 @@ fn test_delegated_valid_until_ledger_is_bound_by_signature() {
     );
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
+}
+
+// ─── SEP-41 conformance suite (#814) ─────────────────────────────────────────
+//
+// Exercises every SEP-41 entry point exposed by `allowlist-token`, checks that
+// the emitted events match the standard, and covers the edge cases called out
+// in the issue: zero amounts, self-transfer, allowance expiry/over-spend, and
+// the allowlist-denied paths.
+
+/// Register a fresh allowlist-token with `alice` and `bob` allowlisted and
+/// funded on the underlying token. Returns the token double client too.
+fn setup_sep41(
+    env: &Env,
+) -> (
+    Address,
+    Address,
+    Address,
+    Address,
+    AllowlistTokenClient<'_>,
+    MockTokenClient<'_>,
+) {
+    let (admin, token_id, _contract_id, client) = setup(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
+    let token = MockTokenClient::new(env, &token_id);
+    token.set_balance(&alice, &1_000);
+    token.set_balance(&bob, &1_000);
+    token.set_total_supply(&2_000);
+    (admin, token_id, alice, bob, client, token)
+}
+
+// ── Metadata ────────────────────────────────────────────────────────────────
+
+#[test]
+fn sep41_decimals_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.decimals(), token.decimals());
+    assert_eq!(client.decimals(), 7);
+}
+
+#[test]
+fn sep41_name_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.name(), token.name());
+}
+
+#[test]
+fn sep41_symbol_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.symbol(), token.symbol());
+}
+
+#[test]
+fn sep41_total_supply_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.total_supply(), token.total_supply());
+    assert_eq!(client.total_supply(), 2_000);
+}
+
+// ── balance ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn sep41_balance_matches_underlying_token() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    assert_eq!(client.balance(&alice), token.balance(&alice));
+    assert_eq!(client.balance(&bob), token.balance(&bob));
+}
+
+#[test]
+fn sep41_balance_of_unknown_address_is_zero() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, _bob, client, _token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+    assert_eq!(client.balance(&stranger), 0);
+}
+
+// ── allowance / approve ─────────────────────────────────────────────────────
+
+#[test]
+fn sep41_allowance_defaults_to_zero() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, _token) = setup_sep41(&env);
+    assert_eq!(client.allowance(&alice, &bob), 0);
+}
+
+#[test]
+fn sep41_approve_sets_allowance_and_emits_event() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+
+    assert_eq!(client.allowance(&alice, &bob), 250);
+    assert_eq!(token.allowance(&alice, &bob), 250);
+
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, token.address);
+    assert_eq!(
+        topics,
+        (symbol_short!("approve"), alice.clone(), bob.clone()).into_val(&env)
+    );
+    assert_eq!(data, (250i128, expiration).into_val(&env));
+}
+
+#[test]
+fn sep41_approve_overwrites_previous_allowance() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, _token) = setup_sep41(&env);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    client.approve(&alice, &bob, &10, &expiration);
+    assert_eq!(client.allowance(&alice, &bob), 10);
+}
+
+#[test]
+fn sep41_allowance_expires_after_expiration_ledger() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, _token) = setup_sep41(&env);
+    let expiration = env.ledger().sequence() + 10;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    assert_eq!(client.allowance(&alice, &bob), 250);
+
+    // Advance past the expiration ledger: the allowance must read as zero.
+    env.ledger().set_sequence_number(expiration + 1);
+    assert_eq!(client.allowance(&alice, &bob), 0);
+}
+
+#[test]
+fn sep41_transfer_from_after_allowance_expiry_fails() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let carol = Address::generate(&env);
+    client.add_to_allowlist(&client.get_admin(), &carol, &None);
+    let expiration = env.ledger().sequence() + 10;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    env.ledger().set_sequence_number(expiration + 1);
+
+    assert_eq!(
+        client.try_transfer_from(&bob, &alice, &carol, &100),
+        Err(Ok(Error::InsufficientAllowance))
+    );
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_from_over_allowance_fails() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let carol = Address::generate(&env);
+    client.add_to_allowlist(&client.get_admin(), &carol, &None);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &50, &expiration);
+
+    assert_eq!(
+        client.try_transfer_from(&bob, &alice, &carol, &51),
+        Err(Ok(Error::InsufficientAllowance))
+    );
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_from_within_allowance_succeeds() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let carol = Address::generate(&env);
+    client.add_to_allowlist(&client.get_admin(), &carol, &None);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    assert!(client.transfer_from(&bob, &alice, &carol, &100));
+
+    assert_eq!(token.last_transfer(), Some((alice, carol, 100)));
+}
+
+// ── transfer ────────────────────────────────────────────────────────────────
+
+#[test]
+fn sep41_transfer_emits_standard_event() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    assert!(client.transfer(&alice, &bob, &100));
+
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, token.address);
+    assert_eq!(
+        topics,
+        (symbol_short!("transfer"), alice.clone(), bob.clone()).into_val(&env)
+    );
+    assert_eq!(data, 100i128.into_val(&env));
+}
+
+#[test]
+fn sep41_zero_amount_transfer_is_allowed() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    assert!(client.transfer(&alice, &bob, &0));
+    assert_eq!(token.last_transfer(), Some((alice, bob, 0)));
+}
+
+#[test]
+fn sep41_self_transfer_is_allowed() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, _bob, client, token) = setup_sep41(&env);
+
+    assert!(client.transfer(&alice, &alice, &100));
+    assert_eq!(token.last_transfer(), Some((alice.clone(), alice, 100)));
+}
+
+#[test]
+fn sep41_negative_amount_transfer_is_rejected() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &-1),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_denied_when_sender_not_allowlisted() {
+    let env = Env::default();
+    let (_admin, _token_id, _alice, bob, client, token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+    token.set_balance(&stranger, &1_000);
+
+    assert!(!client.transfer(&stranger, &bob, &10));
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_denied_when_recipient_not_allowlisted() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, _bob, client, token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+
+    assert!(!client.transfer(&alice, &stranger, &10));
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_denied_when_allowlisted_after_removal() {
+    let env = Env::default();
+    let (admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+
+    client.remove_from_allowlist(&admin, &bob);
+    assert!(!client.transfer(&alice, &bob, &10));
+    assert_eq!(token.last_transfer(), None);
+}
+
+#[test]
+fn sep41_transfer_from_denied_when_recipient_not_allowlisted() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, bob, client, token) = setup_sep41(&env);
+    let stranger = Address::generate(&env);
+    let expiration = env.ledger().sequence() + 100;
+
+    client.approve(&alice, &bob, &250, &expiration);
+    assert!(!client.transfer_from(&bob, &alice, &stranger, &10));
+    assert_eq!(token.last_transfer(), None);
 }

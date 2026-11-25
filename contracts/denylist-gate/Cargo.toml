@@ -18,6 +18,7 @@ compliance-pausable = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 compliance-pausable = { workspace = true, features = ["testutils"] }
 audit-log = { path = "../audit-log" }
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [features]
 testutils = ["soroban-sdk/testutils", "compliance-pausable/testutils"]

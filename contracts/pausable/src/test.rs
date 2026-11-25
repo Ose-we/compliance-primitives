@@ -2,8 +2,8 @@ use crate::{
     is_paused, pause, pause_with_reason, paused_since, pause_reason, require_not_paused,
     require_paused, unpause,
 };
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::testutils::{Address as _, Events as _};
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, TryFromVal, Val};
 
 /// Minimal harness contract so we can exercise the pausable helpers inside a
 /// real Soroban `Env`. All calls go through `env.register(Harness, ())`,
@@ -50,6 +50,28 @@ impl Harness {
     pub fn check_paused(env: Env) -> bool {
         crate::require_paused(&env);
         true
+    }
+
+    // ─── pauser role ────────────────────────────────────────────────────────
+
+    pub fn set_pauser(env: Env, admin: Address, pauser: Address) {
+        crate::set_pauser(&env, &admin, &pauser);
+    }
+
+    pub fn clear_pauser(env: Env, admin: Address) {
+        crate::clear_pauser(&env, &admin);
+    }
+
+    pub fn get_pauser(env: Env) -> Option<Address> {
+        crate::get_pauser(&env)
+    }
+
+    pub fn pause_as_pauser(env: Env, pauser: Address) {
+        crate::pause_as_pauser(&env, &pauser);
+    }
+
+    pub fn unpause_as_pauser(env: Env, pauser: Address) {
+        crate::unpause_as_pauser(&env, &pauser);
     }
 }
 
@@ -296,4 +318,177 @@ fn test_pause_no_reason_leaves_reason_none() {
     client.pause(); // no reason supplied
     assert!(client.is_paused());
     assert!(client.pause_reason().is_none());
+}
+
+// ─── pauser role ────────────────────────────────────────────────────────────
+
+/// Returns `true` if the event log contains an event whose first topic is
+/// `name` and whose data equals `data`.
+fn has_event(env: &Env, name: &str, data: &Val) -> bool {
+    let target = Symbol::new(env, name);
+    env.events().all().iter().any(|(_, topics, value)| {
+        let topic_matches = topics
+            .get(0)
+            .map(|t| Symbol::try_from_val(env, &t) == Ok(target.clone()))
+            .unwrap_or(false);
+        topic_matches && value == *data
+    })
+}
+
+#[test]
+fn test_get_pauser_default_is_none() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    assert!(client.get_pauser().is_none());
+}
+
+#[test]
+fn test_admin_can_set_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+
+    client.set_pauser(&admin, &pauser);
+    assert_eq!(client.get_pauser(), Some(pauser));
+}
+
+#[test]
+fn test_pauser_can_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    assert!(!client.is_paused());
+    client.pause_as_pauser(&pauser);
+    assert!(client.is_paused());
+}
+
+#[test]
+#[should_panic]
+fn test_non_pauser_cannot_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    let stranger = Address::generate(&env);
+    client.pause_as_pauser(&stranger);
+}
+
+#[test]
+#[should_panic]
+fn test_pauser_cannot_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    client.pause_as_pauser(&pauser);
+    assert!(client.is_paused());
+
+    // Pauser must not be able to unpause.
+    client.unpause_as_pauser(&pauser);
+}
+
+#[test]
+#[should_panic]
+fn test_non_admin_cannot_set_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    // The pauser is not the admin and must not be able to rotate itself.
+    let other = Address::generate(&env);
+    client.set_pauser(&pauser, &other);
+}
+
+#[test]
+#[should_panic]
+fn test_non_admin_cannot_clear_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+
+    client.clear_pauser(&pauser);
+}
+
+#[test]
+fn test_admin_can_clear_pauser() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+    assert_eq!(client.get_pauser(), Some(pauser));
+
+    client.clear_pauser(&admin);
+    assert!(client.get_pauser().is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_cleared_pauser_loses_pause_authority() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+    client.set_pauser(&admin, &pauser);
+    client.clear_pauser(&admin);
+
+    // The previously authorized pauser must no longer be able to pause.
+    client.pause_as_pauser(&pauser);
+}
+
+#[test]
+fn test_pauser_change_events_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+
+    let admin = Address::generate(&env);
+    let pauser = Address::generate(&env);
+
+    client.set_pauser(&admin, &pauser);
+    let set_data = Val::try_from_val(&env, &Some(pauser.clone())).unwrap();
+    assert!(has_event(&env, "pauser_set", &set_data));
+
+    client.clear_pauser(&admin);
+    let cleared_data = Val::try_from_val(&env, &Option::<Address>::None).unwrap();
+    assert!(has_event(&env, "pauser_cleared", &cleared_data));
 }

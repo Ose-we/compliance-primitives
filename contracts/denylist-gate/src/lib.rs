@@ -32,7 +32,26 @@
 //! remain admin-only.
 //!
 //! `initialize_multisig` (admin-only, callable once) additionally installs an
-//! M-of-N signer set. From then on the signer set is governed as follows:
+//! M-of-N signer set. From then on the signer set gates denylist mutations:
+//!
+//! - `add_to_denylist`, `remove_from_denylist` and
+//!   `remove_multiple_from_denylist` take the calling `caller` explicitly.
+//!   Each call runs `caller.require_auth()` and then requires `caller` to be in
+//!   the *current* signer set; any other address is rejected with
+//!   `NotAuthorized`. The `Admin` and `ComplianceOfficer` no longer have
+//!   unilateral denylist authority once multisig mode is enabled.
+//! - A denylist mutation does not take effect on a single signer's say-so.
+//!   Each call records one approval from `caller` for that exact action
+//!   (`DenyAdd(X)` / `DenyRemove(X)`), de-duplicated per signer. The mutation
+//!   is applied, and its pending approvals cleared, only once `threshold`
+//!   distinct current signers have approved it. Until then the call returns
+//!   `Ok(())` with the mutation still pending.
+//! - `Admin` keeps every admin-only power (pause, officer assignment,
+//!   audit-log configuration, upgrades, admin rotation, signer governance).
+//!   `ComplianceOfficer` keeps its role but has no denylist authority while
+//!   multisig mode is enabled.
+//!
+//! The signer set governs its own membership as follows:
 //!
 //! - `add_signer` and `remove_signer` take the calling `caller` explicitly.
 //!   Each call runs `caller.require_auth()` and then requires `caller` to be in
@@ -113,28 +132,26 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The M-of-N signer set, stored under `DataKey::SignerSet` in instance
 /// storage once `initialize_multisig` has run.
 ///
-/// **Scope of the multisig layer.** The signer set only governs *itself*:
-/// `add_signer`, `remove_signer` and `set_threshold` each need `threshold`
-/// distinct approvals from current `signers` before they take effect.
-///
-/// It is **not** connected to denylist mutations or to the other admin
-/// operations. After `initialize_multisig`:
+/// **Scope of the multisig layer.** Once installed, the signer set gates
+/// denylist mutations as well as its own membership:
 ///
 /// - `add_to_denylist`, `remove_from_denylist` and
-///   `remove_multiple_from_denylist` are still gated by the single-admin
-///   `require_compliance_authority` check, i.e. the `Admin` or the
-///   `ComplianceOfficer` alone can mutate the denylist.
+///   `remove_multiple_from_denylist` each need `threshold` distinct approvals
+///   from current `signers` before they take effect. The single-admin
+///   `require_compliance_authority` check is bypassed entirely in this mode.
+/// - `add_signer`, `remove_signer` and `set_threshold` each need `threshold`
+///   distinct approvals from current `signers` before they take effect.
 /// - `Admin` keeps every admin-only power (pause, officer assignment,
 ///   audit-log configuration, upgrades, admin rotation). `ComplianceOfficer`
-///   is unchanged.
-/// - Signers have no denylist or admin rights by virtue of being signers.
+///   keeps its role but has no denylist authority while multisig is enabled.
+/// - Signers have no admin rights by virtue of being signers.
 ///
-/// Treat the signer set as a separate, currently-unconnected governance
-/// layer, not as a replacement for the admin key.
+/// Treat the signer set as the governance layer for denylist mutations, not
+/// as a replacement for the admin key for the remaining admin operations.
 #[contracttype]
 #[derive(Clone)]
 pub struct SignerSet {
-    /// Distinct addresses allowed to approve signer-set changes.
+    /// Distinct addresses allowed to approve signer-set and denylist changes.
     pub signers: Vec<Address>,
     /// Number of distinct current signers whose approval applies a change
     /// (`1 <= threshold <= signers.len()`).
@@ -158,13 +175,17 @@ pub struct PendingApproval {
 /// starts a fresh proposal.
 pub const APPROVAL_TTL_LEDGERS: u32 = 120_960;
 
-/// A signer-set change that needs `threshold` distinct approvals to apply.
+/// An action that needs `threshold` distinct signer approvals to apply.
 #[contracttype]
 #[derive(Clone)]
 pub enum SignerAction {
     Add(Address),
     Remove(Address),
     SetThreshold(u32),
+    /// Add `address` to the denylist (multisig mode only).
+    DenyAdd(Address),
+    /// Remove `address` from the denylist (multisig mode only).
+    DenyRemove(Address),
 }
 
 #[contractclient(name = "AuditLogClient")]
@@ -335,6 +356,9 @@ pub enum Error {
     NoPendingAdmin = 13,
     PendingAdminMismatch = 14,
     UpgradeDelayTooShort = 15,
+    /// The caller is not a current signer, or multisig mode is required for
+    /// this operation but has not been enabled.
+    SignerApprovalRequired = 16,
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +647,15 @@ impl DenylistGate {
             .unwrap_or(false)
     }
 
-    /// Add `address` to the denylist. Admin or compliance-officer.
+    /// Add `address` to the denylist.
+    ///
+    /// **Single-admin mode** (no signer set installed): `caller` must be the
+    /// `Admin` or the `ComplianceOfficer`.
+    ///
+    /// **Multisig mode** (signer set installed): `caller` must authorize the
+    /// call and be in the current signer set. The entry is added once
+    /// `threshold` distinct current signers have approved this exact action;
+    /// until then the call returns `Ok(())` with the mutation still pending.
     ///
     /// Uses persistent storage with a long TTL to avoid fail-open archival.
     ///
@@ -632,9 +664,11 @@ impl DenylistGate {
     /// configuration keys (admin, pause flag, signer set, ...) are kept alive
     /// separately: Soroban never extends instance TTL implicitly, so every
     /// write path (and `check`) calls `extend_instance_ttl` explicitly.
-    pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+    pub fn add_to_denylist(env: Env, caller: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
+        if let Some(signer_set) = Self::require_denylist_authority(&env, &caller)? {
+            return Self::approve(&env, caller, SignerAction::DenyAdd(address), signer_set);
+        }
 
         const MAX_TTL: u32 = 6_311_520;
         const THRESHOLD: u32 = MAX_TTL / 2;
@@ -653,10 +687,17 @@ impl DenylistGate {
         Ok(())
     }
 
-    /// Remove `address` from the denylist. Admin or compliance-officer.
-    pub fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+    /// Remove `address` from the denylist.
+    ///
+    /// **Single-admin mode**: `caller` must be the `Admin` or the
+    /// `ComplianceOfficer`. **Multisig mode**: `caller` must be a current
+    /// signer and `threshold` distinct signers must approve the removal before
+    /// it takes effect.
+    pub fn remove_from_denylist(env: Env, caller: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
+        if let Some(signer_set) = Self::require_denylist_authority(&env, &caller)? {
+            return Self::approve(&env, caller, SignerAction::DenyRemove(address), signer_set);
+        }
         env.storage()
             .persistent()
             .remove(&DataKey::Denied(address.clone()));
@@ -668,16 +709,31 @@ impl DenylistGate {
         Ok(())
     }
 
-    /// Remove every address in `addresses` from the denylist. Admin or compliance-officer.
+    /// Remove every address in `addresses` from the denylist.
+    ///
+    /// **Single-admin mode**: `caller` must be the `Admin` or the
+    /// `ComplianceOfficer`. **Multisig mode**: `caller` must be a current
+    /// signer and `threshold` distinct signers must approve the removal of
+    /// each address before it takes effect.
     pub fn remove_multiple_from_denylist(
         env: Env,
-        admin: Address,
+        caller: Address,
         addresses: Vec<Address>,
     ) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
         if addresses.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
+        }
+        if let Some(signer_set) = Self::require_denylist_authority(&env, &caller)? {
+            for address in addresses.iter() {
+                Self::approve(
+                    &env,
+                    caller.clone(),
+                    SignerAction::DenyRemove(address),
+                    signer_set.clone(),
+                )?;
+            }
+            return Ok(());
         }
 
         for address in addresses.iter() {
@@ -724,11 +780,12 @@ impl DenylistGate {
     /// `signers` must be non-empty and free of duplicates, and `threshold`
     /// must be between 1 and `signers.len()`.
     ///
-    /// This does **not** switch the contract into multisig mode for denylist
-    /// mutations: `add_to_denylist` / `remove_from_denylist` keep using the
-    /// single-admin (`Admin` or `ComplianceOfficer`) check, and `Admin`
-    /// retains all admin-only operations. The signer set only governs its own
-    /// membership and threshold. See [`SignerSet`].
+    /// Installing a signer set switches the contract into multisig mode for
+    /// denylist mutations: `add_to_denylist` / `remove_from_denylist` /
+    /// `remove_multiple_from_denylist` then require `threshold` distinct
+    /// signer approvals instead of the single-admin (`Admin` or
+    /// `ComplianceOfficer`) check. `Admin` retains all admin-only operations.
+    /// See [`SignerSet`].
     pub fn initialize_multisig(
         env: Env,
         admin: Address,
@@ -953,6 +1010,40 @@ impl DenylistGate {
                 }
                 .publish(env);
             }
+            SignerAction::DenyAdd(address) => {
+                const MAX_TTL: u32 = 6_311_520;
+                const THRESHOLD: u32 = MAX_TTL / 2;
+                let key = DataKey::Denied(address.clone());
+                env.storage().persistent().set(&key, &true);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, THRESHOLD, MAX_TTL);
+                DenyAdd {
+                    address: address.clone(),
+                }
+                .publish(env);
+                Self::record_audit(
+                    env,
+                    Symbol::new(env, "deny_add"),
+                    &address,
+                    "address added to denylist",
+                );
+            }
+            SignerAction::DenyRemove(address) => {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Denied(address.clone()));
+                DenyRemove {
+                    address: address.clone(),
+                }
+                .publish(env);
+                Self::record_audit(
+                    env,
+                    Symbol::new(env, "deny_remove"),
+                    &address,
+                    "address removed from denylist",
+                );
+            }
         }
         Ok(())
     }
@@ -969,6 +1060,24 @@ impl DenylistGate {
             return Err(Error::NotAuthorized);
         }
         Ok(())
+    }
+
+    /// Authorizes a denylist mutation.
+    ///
+    /// Returns `Ok(Some(set))` when multisig mode is enabled, in which case
+    /// `caller` has been verified as a current signer and the caller must
+    /// route the mutation through [`Self::approve`]. Returns `Ok(None)` in
+    /// single-admin mode after verifying `caller` is the `Admin` or
+    /// `ComplianceOfficer`.
+    fn require_denylist_authority(
+        env: &Env,
+        caller: &Address,
+    ) -> Result<Option<SignerSet>, Error> {
+        if env.storage().instance().has(&DataKey::SignerSet) {
+            return Self::require_signer(env, caller).map(Some);
+        }
+        Self::require_compliance_authority(env, caller)?;
+        Ok(None)
     }
 
     fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
