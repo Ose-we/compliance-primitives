@@ -268,11 +268,11 @@ jobs:
         run: bash scripts/check-contract-line-count.sh
 
   semver-checks:
-    name: cargo semver-checks
+    name: cargo semver-checks (compliance-pausable)
     runs-on: ubuntu-latest
-    # Check for accidental breaking API changes in public crates.
-    # Currently scopes to compliance-pausable (a publishable shared crate).
-    # Add --package flags for additional crates as they become public.
+    # Check for accidental breaking API changes in published crates against
+    # crates.io. Contract crates are publish = false and use the
+    # semver-checks-contracts job below instead.
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -283,3 +283,38 @@ jobs:
         run: cargo install cargo-semver-checks
       - name: Check semver compliance for compliance-pausable
         run: cargo semver-checks check-release --package compliance-pausable
+
+  semver-checks-contracts:
+    name: cargo semver-checks (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    # Contract crates are publish = false, so there is no crates.io baseline.
+    # Compare against the merge-base with main instead. shortcut: a contract
+    # added in this PR has no baseline and fails until it is on main, so add
+    # it to the matrix only after it has landed.
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - allowlist-token
+          - audit-log
+          - circuit-breaker
+          - compliance-aggregator
+          - compliance-check
+          - denylist-gate
+          - jurisdiction-flag
+          - multisig-admin
+          - policy-engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks
+      - name: Check semver compliance for ${{ matrix.package }}
+        run: |
+          base="$(git merge-base HEAD origin/main)"
+          cargo semver-checks check-release --package "${{ matrix.package }}" --baseline-rev "$base"

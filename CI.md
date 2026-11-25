@@ -31,7 +31,11 @@ Runs `cargo-deny` to check for:
 ### cargo semver-checks
 Runs `cargo-semver-checks check-release` against publishable crates to catch accidental breaking API changes before merge.
 
-**Scope:** Currently checks `compliance-pausable` (the primary shared/publishable crate). Add `--package` flags when additional crates become public.
+**Scope:**
+- `semver-checks` checks `compliance-pausable` against its crates.io baseline (the one published crate).
+- `semver-checks-contracts` runs one matrix job per contract crate in `contracts/` (all `publish = false`). It compares against `git merge-base HEAD origin/main` via `--baseline-rev`, since there is no registry baseline. A contract added in a PR fails this job until it exists on main, at which point add it to the matrix.
+
+Examples in `examples/` are not checked: they are consumer demos, not libraries that others depend on.
 
 ## Scheduled Jobs (.github/workflows/scheduled-deny.yml)
 
