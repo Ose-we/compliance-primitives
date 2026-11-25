@@ -138,6 +138,21 @@ jobs:
       - name: Check wasm binary sizes against budget
         run: bash scripts/check-wasm-size.sh
 
+  cost-table:
+    name: cost table (BENCHMARKS.md)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12" # tomllib needs 3.11+
+      # Regenerate from budget-baselines.toml, then fail if the committed
+      # table is stale. Run the script locally to fix the diff.
+      - name: Regenerate cost table
+        run: python3 scripts/gen-cost-table.py
+      - name: Fail if BENCHMARKS.md cost table is stale
+        run: git diff --exit-code -- BENCHMARKS.md
+
   accessibility:
     name: accessibility audit (web/)
     runs-on: ubuntu-latest
