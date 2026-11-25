@@ -216,8 +216,8 @@ jobs:
                   FAILED_CRATES+=("$CRATE_NAME")
                 fi
               else
-                echo "ERROR: Directory $dir exists but has no Cargo.toml"
-                exit 1
+                # Non-crate directories (e.g. js-client, README-only dirs) are skipped.
+                echo "Skipping $CRATE_NAME (no Cargo.toml)"
               fi
             fi
           done
