@@ -831,6 +831,11 @@ impl PolicyEngine {
             .ok_or(Error::NotInitialized)
     }
 
+    /// Returns whether the policy engine is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        compliance_pausable::is_paused(&env)
+    }
+
     /// Returns the full configured policy tree as a [`PolicyNode`].
     ///
     /// Off-chain tooling and auditors can call this single view to read back

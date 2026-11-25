@@ -14,6 +14,7 @@ A configurable policy composition contract that evaluates denylist and jurisdict
 | `evaluate_verbose(from, to) -> (bool, Option<CheckFailure>)` | Return the combined policy decision together with failure details when the policy rejects. |
 | `get_checks()` | Read the configured checks. |
 | `get_op()` | Read whether checks are combined with all/any semantics. |
+| `is_paused()` | Read whether the policy engine is currently paused. |
 
 ## Failure reporting semantics
 
