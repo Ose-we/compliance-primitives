@@ -85,6 +85,9 @@ enum DataKey {
     /// last paused via [`pause_with_reason`].  Absent when no reason was
     /// supplied or the contract is not paused.
     PauseReason,
+    /// Optional ledger timestamp at which an automatic pause expires.
+    /// Absent for pauses created by [`pause`] / [`pause_with_reason`].
+    PauseUntil,
 }
 
 /// Returns `true` if the contract is currently paused.
@@ -92,10 +95,20 @@ enum DataKey {
 /// Defaults to `false` when no pause flag has been stored yet, so a freshly
 /// initialized contract starts in the active (unpaused) state.
 pub fn is_paused(env: &Env) -> bool {
-    env.storage()
+    let paused: bool = env
+        .storage()
         .instance()
         .get(&DataKey::Paused)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !paused {
+        return false;
+    }
+    // An incident pause with an expiry stops being effective once the ledger
+    // clock reaches `until` — no explicit unpause required (#804).
+    match env.storage().instance().get::<_, u64>(&DataKey::PauseUntil) {
+        Some(until) => env.ledger().timestamp() < until,
+        None => true,
+    }
 }
 
 /// Set the paused flag to `true` and record the current ledger timestamp.
@@ -133,6 +146,29 @@ pub fn pause_with_reason(env: &Env, reason: Option<String>) {
     }
 }
 
+/// Pause the contract until the given ledger timestamp, then resume
+/// automatically (#804).
+///
+/// The flag, pause timestamp and optional expiry are stored under the same
+/// keys as [`pause`]; `is_paused` returns `false` once `now >= until` without
+/// requiring an explicit [`unpause`] call. Passing `until` at or before the
+/// current ledger timestamp is equivalent to not pausing at all.
+pub fn pause_until(env: &Env, until: u64) {
+    if env.ledger().timestamp() >= until {
+        return;
+    }
+    env.storage().instance().set(&DataKey::Paused, &true);
+    env.storage()
+        .instance()
+        .set(&DataKey::PausedSince, &env.ledger().timestamp());
+    env.storage().instance().set(&DataKey::PauseUntil, &until);
+}
+
+/// Returns the ledger timestamp at which an automatic pause expires.
+pub fn pause_until_at(env: &Env) -> Option<u64> {
+    env.storage().instance().get(&DataKey::PauseUntil)
+}
+
 /// Clear the paused flag, returning the contract to the active state.
 ///
 /// Also clears the stored pause timestamp and reason so they do not linger
@@ -143,6 +179,7 @@ pub fn unpause(env: &Env) {
     env.storage().instance().set(&DataKey::Paused, &false);
     env.storage().instance().remove(&DataKey::PausedSince);
     env.storage().instance().remove(&DataKey::PauseReason);
+    env.storage().instance().remove(&DataKey::PauseUntil);
 }
 
 /// Returns the ledger timestamp (seconds since Unix epoch) at which the
@@ -160,6 +197,9 @@ pub fn unpause(env: &Env) {
 /// }
 /// ```
 pub fn paused_since(env: &Env) -> Option<u64> {
+    if !is_paused(env) {
+        return None;
+    }
     env.storage().instance().get(&DataKey::PausedSince)
 }
 
@@ -169,6 +209,9 @@ pub fn paused_since(env: &Env) -> Option<u64> {
 ///
 /// This value is cleared automatically when [`unpause`] is called.
 pub fn pause_reason(env: &Env) -> Option<String> {
+    if !is_paused(env) {
+        return None;
+    }
     env.storage().instance().get(&DataKey::PauseReason)
 }
 
