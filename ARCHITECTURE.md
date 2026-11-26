@@ -4,7 +4,8 @@ This document describes how the nine contract crates under `contracts/` fit
 together: what each one is for, which category it falls into, and which
 other contracts it calls into or is called by. For the security invariants
 and threat model of each contract, see [`SPEC.md`](SPEC.md). For the on-chain
-event schema, see [`EVENTS.md`](EVENTS.md).
+event schema, see [`EVENTS.md`](EVENTS.md). For runnable call-flow diagrams of
+common setups, see [`docs/PRIMITIVE_COMPOSITION.md`](docs/PRIMITIVE_COMPOSITION.md).
 
 ## Compose, don't inherit
 
