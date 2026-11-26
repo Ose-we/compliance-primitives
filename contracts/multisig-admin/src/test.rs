@@ -1019,3 +1019,66 @@ fn test_execute_succeeds_when_removed_signer_did_not_approve() {
     let result = client.try_get_proposal(&proposal_id);
     assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
 }
+
+// ─── Issue #802: open proposal index ───────────────────────────────────────
+
+#[test]
+fn test_list_proposals_tracks_open_ids() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[1u8; 32]);
+    let first = client.propose(&payload, &100);
+    let second = client.propose(&payload, &100);
+    assert_eq!(first, 0);
+    assert_eq!(second, 1);
+
+    let ids = client.list_proposals(&0, &10);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get(0), Some(0));
+    assert_eq!(ids.get(1), Some(1));
+
+    let page = client.list_proposals(&1, &1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0), Some(1));
+}
+
+#[test]
+fn test_list_proposals_prunes_cancelled_and_executed() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (signers, _id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[2u8; 32]);
+
+    let cancelled = client.propose(&payload, &100);
+    let executed = client.propose(&payload, &100);
+    let remaining = client.propose(&payload, &100);
+
+    client.cancel_proposal(&cancelled, &signers.get(0).unwrap());
+    assert!(!client.list_proposals(&0, &10).contains(cancelled));
+
+    client.approve(&executed, &signers.get(0).unwrap());
+    client.approve(&executed, &signers.get(1).unwrap());
+    client.execute(&executed);
+
+    let ids = client.list_proposals(&0, &10);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.get(0), Some(remaining));
+}
+
+#[test]
+fn test_list_proposals_prunes_expired() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_signers, _id, client) = setup_multisig(&env, 3, 2);
+    let payload = Bytes::from_array(&env, &[3u8; 32]);
+
+    let expired = client.propose(&payload, &20);
+    client.propose(&payload, &100);
+    env.ledger().set_sequence_number(21);
+
+    let ids = client.list_proposals(&0, &10);
+    assert_eq!(ids.len(), 1);
+    assert!(client.try_get_proposal(&expired).is_err());
+}
