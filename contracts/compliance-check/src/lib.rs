@@ -37,6 +37,15 @@
 //!     check.is_compliant(env, address.clone())
 //! }
 //! ```
+//!
+//! ## Amount-aware checks
+//!
+//! Some compliance rules depend on the transfer amount (e.g. travel-rule
+//! thresholds).  [`ComplianceCheck::is_compliant_with_amount`] accepts an
+//! optional amount so such rules can be expressed.  It has a default
+//! implementation that ignores the amount and delegates to
+//! [`ComplianceCheck::is_compliant`], so existing implementors keep working
+//! unchanged; contracts with amount limits override it.
 #![no_std]
 
 use soroban_sdk::{Address, Env};
@@ -64,6 +73,20 @@ pub trait ComplianceCheck {
     /// Returns `true` if `address` passes this compliance check, `false`
     /// otherwise.
     fn is_compliant(env: &Env, address: Address) -> bool;
+
+    /// Returns `true` if `address` passes this compliance check for a transfer
+    /// of `amount`, `false` otherwise.
+    ///
+    /// `amount` is optional so callers that do not know (or care about) the
+    /// transfer size can still use the check.  The default implementation
+    /// ignores `amount` and delegates to [`Self::is_compliant`], preserving
+    /// backward compatibility for implementors without amount-based rules.
+    /// Contracts that enforce amount limits (e.g. travel-rule thresholds)
+    /// should override this method.
+    fn is_compliant_with_amount(env: &Env, address: Address, amount: Option<i128>) -> bool {
+        let _ = amount;
+        Self::is_compliant(env, address)
+    }
 }
 
 #[cfg(test)]

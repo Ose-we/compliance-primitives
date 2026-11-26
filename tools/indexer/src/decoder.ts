@@ -22,7 +22,11 @@
  * For policy-engine:
  *
  *   PolicyResult topics: [Symbol("policy_result"), Bool(passed)]
- *               data:   Map { from: Address, to: Address }
+ *               data:   Map { from: Address, to: Address,
+ *                            policy_version: U32, policy_name: String }
+ *
+ *   policy_version / policy_name are optional for backward compatibility
+ *   with events emitted before policy versioning was introduced.
  *
  * For multisig-admin:
  *
@@ -377,6 +381,8 @@ export function decodeEvent(
       policyFrom: null,
       policyTo: null,
       policyPassed: null,
+      policyVersion: null,
+      policyName: null,
       rawTopics: JSON.stringify(raw.topic),
       rawData: raw.value ?? "",
     };
@@ -409,6 +415,8 @@ export function decodeEvent(
           policyFrom: null,
           policyTo: null,
           policyPassed: null,
+          policyVersion: null,
+          policyName: null,
           signerAddress: null,
           newThreshold: null,
           validCount: null,
@@ -442,7 +450,11 @@ export function decodeEvent(
     //
     // PolicyResult has a different shape from the address-keyed events:
     //   topics: [Symbol("policy_result"), Bool(passed)]
-    //   data:   Map { from: Address, to: Address }
+    //   data:   Map { from: Address, to: Address,
+    //                 policy_version: U32, policy_name: String }
+    //
+    // policy_version / policy_name are optional: older events predate policy
+    // versioning, so we default them to null when absent.
     //
     // Handle it here before the section that requires topics[1] to be an
     // Address.
@@ -453,11 +465,19 @@ export function decodeEvent(
 
       let policyFrom: string | null = null;
       let policyTo: string | null = null;
+      let policyVersion: number | null = null;
+      let policyName: string | null = null;
 
       const fromVal = mapField(dataVal, "from");
       const toVal = mapField(dataVal, "to");
       if (fromVal?.type === "Address") policyFrom = fromVal.value;
       if (toVal?.type === "Address") policyTo = toVal.value;
+
+      const versionVal = mapField(dataVal, "policy_version");
+      if (versionVal?.type === "U32") policyVersion = versionVal.value;
+
+      const nameVal = mapField(dataVal, "policy_name");
+      if (nameVal?.type === "String") policyName = nameVal.value;
 
       return {
         ledgerSequence: raw.ledger,
@@ -474,6 +494,8 @@ export function decodeEvent(
         policyFrom,
         policyTo,
         policyPassed: passedVal.value,
+        policyVersion,
+        policyName,
         signerAddress: null,
         newThreshold: null,
         validCount: null,
@@ -526,6 +548,8 @@ export function decodeEvent(
         policyFrom: null,
         policyTo: null,
         policyPassed: null,
+        policyVersion: null,
+        policyName: null,
         signerAddress: signerVal.value,
         newThreshold: null,
         validCount: null,
@@ -551,6 +575,8 @@ export function decodeEvent(
         policyFrom: null,
         policyTo: null,
         policyPassed: null,
+        policyVersion: null,
+        policyName: null,
         signerAddress: null,
         newThreshold: dataVal.value,
         validCount: null,
@@ -584,6 +610,8 @@ export function decodeEvent(
         policyFrom: null,
         policyTo: null,
         policyPassed: null,
+        policyVersion: null,
+        policyName: null,
         signerAddress: null,
         newThreshold,
         validCount,
@@ -627,6 +655,8 @@ export function decodeEvent(
       policyFrom: null,
       policyTo: null,
       policyPassed: null,
+      policyVersion: null,
+      policyName: null,
       signerAddress: null,
       newThreshold: null,
       validCount: null,
