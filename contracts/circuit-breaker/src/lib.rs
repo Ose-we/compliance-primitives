@@ -87,11 +87,11 @@ pub const MAX_GUARDIANS: u32 = 10;
 
 /// Extend the contract's instance storage when its remaining TTL drops below
 /// this many ledgers (~7 days at ~5s/ledger).
-pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
+pub const INSTANCE_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD;
 
 /// Target remaining TTL, in ledgers, after an extension (~90 days at
 /// ~5s/ledger).
-pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200;
+pub const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO;
 
 /// Maximum number of freeze incidents retained by the contract.
 pub const MAX_FREEZE_HISTORY: u32 = 20;

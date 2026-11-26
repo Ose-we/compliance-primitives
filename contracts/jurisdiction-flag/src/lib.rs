@@ -73,9 +73,9 @@ fn is_known_country(code: [u8; 2]) -> bool {
 }
 
 /// Extend persistent jurisdiction entries below 120,960 ledgers (~7 days).
-const TTL_THRESHOLD: u32 = 120_960;
+const TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD;
 /// Target 1,555,200 ledgers (~90 days) after extension.
-const TTL_EXTEND_TO: u32 = 1_555_200;
+const TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO;
 
 /// Maximum number of entries accepted by `set_multiple_jurisdictions` in a
 /// single call. Keeps transaction costs bounded and prevents resource
@@ -85,9 +85,9 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 /// Instance-storage TTL policy: whenever the remaining instance TTL drops
 /// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
 /// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
-pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+pub const INSTANCE_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD; // ~7 days
 /// Target instance TTL after an extension.
-pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+pub const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; // ~90 days
 
 /// Maximum number of jurisdiction codes that can be attached to a single
 /// address. Enforced in `add_jurisdiction` to prevent a compromised or buggy

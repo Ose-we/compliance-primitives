@@ -15,6 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **allowlist-token**: `add_to_allowlist_until(admin, address, valid_until)`
+  allowlists an address through ledger `valid_until` (inclusive). Expiry is
+  enforced by both `is_allowed` and `transfer` (#756).
+- **allowlist-token**: allowlist entries record `added_by` and
+  `added_at_ledger`, returned by `get_allowlist_entry` as the new
+  `AllowlistEntryInfo`. Entries approved before this change report `None`
+  (#757).
+- **compliance-ttl**: new `crates/ttl-policy` crate holding the shared
+  storage TTL constants (#754).
+
+### Changed
+
+- **allowlist-token**: `get_allowlist_entry` returns `AllowlistEntryInfo`
+  instead of `AllowlistEntry`. The `expiration_ledger` field is unchanged
+  (#757).
+- Contracts that extended TTLs with duplicated local constants now use the
+  shared `compliance-ttl` values; public constant names are unchanged (#754).
+- **denylist-gate**: `add_to_denylist` uses the shared denylist TTL policy
+  instead of constants local to the function (#754).
+
 ### allowlist-token
 
 #### Changed
@@ -29,14 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 
-- `pause` now blocks `add_to_allowlist`, `add_to_allowlist_delegated`, and
-  `remove_from_allowlist`, matching the doc comment "Pause all mutating
-  operations". Previously only `transfer` checked the pause flag, so a
-  compromised key could keep mutating the allowlist while the contract
-  appeared paused. Admin rotation (`propose_admin` / `accept_admin` /
-  `transfer_admin`) and `unpause` remain available while paused so an
-  operator can always recover (fixes #583, matching the behaviour of
-  `denylist-gate`).
+- **allowlist-token**: `remove_from_allowlist` and
+  `remove_multiple_from_allowlist` skip absent addresses without writing or
+  emitting `AllowRemove`, so event streams only record real removals (#755).
+- **allowlist-token**: `is_allowed_and_extend_ttl` did not compile, and
+  transfers ignored allowlist expiry. Transfers now enforce expiry (#756).
+- **allowlist-token**: `pause` now blocks `add_to_allowlist`,
+  `add_to_allowlist_delegated`, and `remove_from_allowlist`, matching the
+  doc comment "Pause all mutating operations". Previously only `transfer`
+  checked the pause flag, so a compromised key could keep mutating the
+  allowlist while the contract appeared paused. Admin rotation
+  (`propose_admin` / `accept_admin` / `transfer_admin`) and `unpause`
+  remain available while paused so an operator can always recover
+  (fixes #583, matching the behaviour of `denylist-gate`).
 
 #### Added
 
