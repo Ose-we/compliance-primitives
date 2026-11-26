@@ -99,6 +99,8 @@ enum DataKey {
     DenyEntry(Address),
     /// Number of addresses currently on the denylist. Instance storage.
     DenylistCount,
+    /// Sanctions list an entry came from (e.g. `OFAC`). Persistent storage.
+    DeniedSource(Address),
     PendingUpgrade,
     /// Approvals collected so far for one pending signer-set change.
     /// Persistent storage (not instance), so abandoned proposals do not bloat
@@ -212,6 +214,24 @@ pub trait AuditLogInterface {
 pub struct DenyAdd {
     #[topic]
     pub address: Address,
+}
+
+/// Emitted alongside [`DenyAdd`] when an entry is tagged with its source list.
+#[contractevent]
+pub struct DenyAddSourced {
+    #[topic]
+    pub address: Address,
+    #[topic]
+    pub source: Symbol,
+}
+
+/// View of a single denylist entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenylistEntry {
+    pub address: Address,
+    /// Sanctions list the entry came from, if tagged.
+    pub source: Option<Symbol>,
 }
 
 #[contractevent]
@@ -367,6 +387,10 @@ pub enum Error {
     PendingAdminMismatch = 14,
     UpgradeDelayTooShort = 15,
     InvalidExpiry = 16,
+    /// `check_pair`: the sender (`from`) is denylisted.
+    SenderDenied = 17,
+    /// `check_pair`: the receiver (`to`) is denylisted.
+    ReceiverDenied = 18,
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +690,33 @@ impl DenylistGate {
     /// separately: Soroban never extends instance TTL implicitly, so every
     /// write path (and `check`) calls `extend_instance_ttl` explicitly.
     pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
-        Self::deny(&env, &admin, &address, None)
+        Self::deny(&env, &admin, &address, None, None)
+    }
+
+    /// Add `address` to the denylist, tagged with the sanctions list it came
+    /// from (e.g. `OFAC`, `UN`, `EU`). Admin or compliance-officer.
+    ///
+    /// Emits [`DenyAdd`] and [`DenyAddSourced`]; the tag is returned by
+    /// [`get_entry`](Self::get_entry) and cleared on removal.
+    pub fn add_to_denylist_with_source(
+        env: Env,
+        admin: Address,
+        address: Address,
+        source: Symbol,
+    ) -> Result<(), Error> {
+        Self::deny(&env, &admin, &address, None, Some(source))
+    }
+
+    /// Return the denylist entry for `address`, or `None` if not denylisted.
+    pub fn get_entry(env: Env, address: Address) -> Option<DenylistEntry> {
+        if !Self::is_denied(&env, &address) {
+            return None;
+        }
+        let source = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DeniedSource(address.clone()));
+        Some(DenylistEntry { address, source })
     }
 
     /// Add `address` to the denylist for a limited time. Admin or compliance-officer.
@@ -684,7 +734,7 @@ impl DenylistGate {
         address: Address,
         until_ledger: u32,
     ) -> Result<(), Error> {
-        Self::deny(&env, &admin, &address, Some(until_ledger))
+        Self::deny(&env, &admin, &address, Some(until_ledger), None)
     }
 
     /// Shared body of the add entry points.
@@ -693,7 +743,11 @@ impl DenylistGate {
         admin: &Address,
         address: &Address,
         expires_at_ledger: Option<u32>,
+        source: Option<Symbol>,
     ) -> Result<(), Error> {
+        const MAX_TTL: u32 = 6_311_520;
+        const THRESHOLD: u32 = MAX_TTL / 2;
+
         Self::reject_if_paused(env)?;
         Self::require_compliance_authority(env, admin)?;
         if let Some(until) = expires_at_ledger {
@@ -704,11 +758,29 @@ impl DenylistGate {
 
         Self::record_entry(env, admin, address, expires_at_ledger);
 
+        let source_key = DataKey::DeniedSource(address.clone());
+        match &source {
+            Some(src) => {
+                env.storage().persistent().set(&source_key, src);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&source_key, THRESHOLD, MAX_TTL);
+            }
+            None => env.storage().persistent().remove(&source_key),
+        }
+
         DenyAdd {
             address: address.clone(),
         }
-        .publish(&env);
-        Self::record_audit(&env, Symbol::new(&env, "deny_add"), &address, "address added to denylist");
+        .publish(env);
+        if let Some(source) = source {
+            DenyAddSourced {
+                address: address.clone(),
+                source,
+            }
+            .publish(env);
+        }
+        Self::record_audit(env, Symbol::new(env, "deny_add"), address, "address added to denylist");
         Ok(())
     }
 
@@ -807,6 +879,26 @@ impl DenylistGate {
             flags.push_back(Self::is_denied(&env, &address));
         }
         Ok(flags)
+    }
+
+    /// Check both sides of a transfer in one call.
+    ///
+    /// Returns `Ok(())` if neither address is denylisted, otherwise
+    /// [`Error::SenderDenied`] (checked first) or [`Error::ReceiverDenied`].
+    /// **Not** affected by pause state.
+    pub fn check_pair(env: Env, from: Address, to: Address) -> Result<(), Error> {
+        if !Self::check(env.clone(), from) {
+            return Err(Error::SenderDenied);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get(&DataKey::Denied(to))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        Err(Error::ReceiverDenied)
     }
 
     /// Unified compliance check — returns `true` if `address` is NOT on the
@@ -1206,6 +1298,9 @@ impl DenylistGate {
         env.storage()
             .persistent()
             .remove(&DataKey::Denied(address.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DeniedSource(address.clone()));
     }
 
     fn reject_if_paused(env: &Env) -> Result<(), Error> {

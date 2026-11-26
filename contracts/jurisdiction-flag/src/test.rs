@@ -1433,3 +1433,65 @@ fn test_set_jurisdiction_cooldown_is_issuer_only() {
         Err(Ok(Error::NotAuthorized))
     );
 }
+
+fn s(env: &Env, v: &str) -> String {
+    String::from_str(env, v)
+}
+
+#[test]
+fn group_name_expands_to_member_codes() {
+    let env = Env::default();
+    let (issuer, _, client) = setup(&env);
+    let user = Address::generate(&env);
+    client.set_jurisdiction(&issuer, &user, &s(&env, "FR"));
+    client.set_group(&issuer, &s(&env, "EU"), &vec![&env, s(&env, "DE"), s(&env, "FR")]);
+    assert_eq!(client.get_group(&s(&env, "EU")).unwrap().len(), 2);
+    assert!(client.is_permitted_jurisdiction(&user, &vec![&env, s(&env, "EU")]));
+    assert!(!client.is_permitted_jurisdiction(&user, &vec![&env, s(&env, "EEA")]));
+    assert!(client.is_permitted_jurisdiction(&user, &vec![&env, s(&env, "US"), s(&env, "EU")]));
+}
+
+#[test]
+fn set_group_rejects_invalid_input() {
+    let env = Env::default();
+    let (issuer, _, client) = setup(&env);
+    assert_eq!(
+        client.try_set_group(&issuer, &s(&env, "EU"), &vec![&env]),
+        Err(Ok(Error::InvalidGroup))
+    );
+    assert_eq!(
+        client.try_set_group(&issuer, &s(&env, "EU"), &vec![&env, s(&env, "fr")]),
+        Err(Ok(Error::InvalidJurisdictionCode))
+    );
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_set_group(&stranger, &s(&env, "EU"), &vec![&env, s(&env, "FR")]),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn block_list_mode_inverts_permission() {
+    let env = Env::default();
+    let (issuer, _, client) = setup(&env);
+    let blocked = Address::generate(&env);
+    let allowed = Address::generate(&env);
+    let unknown = Address::generate(&env);
+    client.set_jurisdiction(&issuer, &blocked, &s(&env, "KP"));
+    client.set_jurisdiction(&issuer, &allowed, &s(&env, "US"));
+    let list = vec![&env, s(&env, "KP"), s(&env, "IR")];
+
+    assert_eq!(client.get_mode(), JurisdictionMode::AllowList);
+    assert!(client.is_permitted_jurisdiction(&blocked, &list));
+    assert!(!client.is_permitted_jurisdiction(&allowed, &list));
+
+    client.set_mode(&issuer, &JurisdictionMode::BlockList);
+    assert_eq!(client.get_mode(), JurisdictionMode::BlockList);
+    assert!(!client.is_permitted_jurisdiction(&blocked, &list));
+    assert!(client.is_permitted_jurisdiction(&allowed, &list));
+    assert!(!client.is_permitted_jurisdiction(&unknown, &list));
+
+    client.set_group(&issuer, &s(&env, "SANCTIONED"), &list);
+    assert!(!client.is_permitted_jurisdiction(&blocked, &vec![&env, s(&env, "SANCTIONED")]));
+    assert!(client.is_permitted_jurisdiction(&allowed, &vec![&env, s(&env, "SANCTIONED")]));
+}

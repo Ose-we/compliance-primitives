@@ -1059,3 +1059,41 @@ fn test_write_path_extends_instance_ttl() {
     client.add_to_denylist(&admin, &Address::generate(&env));
     assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
 }
+
+#[test]
+fn check_pair_reports_failing_side() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    assert_eq!(client.try_check_pair(&a, &b), Ok(Ok(())));
+    client.add_to_denylist(&admin, &b);
+    assert_eq!(client.try_check_pair(&a, &b), Err(Ok(Error::ReceiverDenied)));
+    client.add_to_denylist(&admin, &a);
+    assert_eq!(client.try_check_pair(&a, &b), Err(Ok(Error::SenderDenied)));
+    client.remove_from_denylist(&admin, &b);
+    assert_eq!(client.try_check_pair(&b, &a), Err(Ok(Error::ReceiverDenied)));
+}
+
+#[test]
+fn entries_record_source_list() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    let tagged = Address::generate(&env);
+    let plain = Address::generate(&env);
+    let ofac = Symbol::new(&env, "OFAC");
+    client.add_to_denylist_with_source(&admin, &tagged, &ofac);
+    client.add_to_denylist(&admin, &plain);
+
+    assert_eq!(
+        client.get_entry(&tagged),
+        Some(DenylistEntry { address: tagged.clone(), source: Some(ofac.clone()) })
+    );
+    assert_eq!(client.get_entry(&plain).unwrap().source, None);
+    assert!(client.is_denylisted(&tagged));
+
+    client.remove_from_denylist(&admin, &tagged);
+    assert_eq!(client.get_entry(&tagged), None);
+    client.add_to_denylist(&admin, &tagged);
+    assert_eq!(client.get_entry(&tagged).unwrap().source, None);
+}
