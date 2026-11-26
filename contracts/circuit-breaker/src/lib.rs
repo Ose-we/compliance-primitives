@@ -76,8 +76,13 @@
 //! alongside it and call it after `upgrade`. See `STORAGE_VERSIONING.md`.
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address,
+    BytesN, Env, String, Symbol, Vec,
 };
+
+/// Maximum number of guardians that may be configured. Bounds the cost of
+/// `remove_guardian` and `is_guardian`, which iterate the guardian list.
+pub const MAX_GUARDIANS: u32 = 10;
 
 /// Extend the contract's instance storage when its remaining TTL drops below
 /// this many ledgers (~7 days at ~5s/ledger).
@@ -96,6 +101,10 @@ enum DataKey {
     PendingAdmin,
     Guardians,
     AuditLog,
+    /// Ledger sequence until which a timed freeze (`freeze_for`) is active.
+    FrozenUntil,
+    /// Per-operation freeze flag set by `freeze_scope`.
+    FrozenScope(Symbol),
 }
 
 /// Version + admin metadata about this contract instance, for tooling that
@@ -111,6 +120,33 @@ pub struct Metadata {
 pub struct Frozen {
     #[topic]
     pub caller: Address,
+}
+
+/// Emitted when a timed freeze is set via `freeze_for`. `until_ledger` is the
+/// first ledger sequence at which the freeze is no longer in effect.
+#[contractevent]
+pub struct TimedFrozen {
+    #[topic]
+    pub caller: Address,
+    pub until_ledger: u32,
+}
+
+/// Emitted when a single operation scope is frozen via `freeze_scope`.
+#[contractevent]
+pub struct ScopeFrozen {
+    #[topic]
+    pub caller: Address,
+    #[topic]
+    pub scope: Symbol,
+}
+
+/// Emitted when a single operation scope is unfrozen via `unfreeze_scope`.
+#[contractevent]
+pub struct ScopeUnfrozen {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub scope: Symbol,
 }
 
 #[contractevent]
@@ -184,6 +220,7 @@ pub enum Error {
     NotAuthorized = 3,
     NoPendingAdmin = 4,
     PendingAdminMismatch = 5,
+    TooManyGuardians = 6,
 }
 
 #[contract]
@@ -234,6 +271,73 @@ impl CircuitBreaker {
         Ok(())
     }
 
+    /// Freeze the breaker for `ledgers` ledgers. Callable by the admin or any
+    /// guardian. The freeze lifts automatically once the current ledger
+    /// sequence reaches `current + ledgers`, unless extended by another
+    /// `freeze_for` call or made permanent with `freeze`. A later
+    /// `freeze_for` never shortens an existing timed freeze.
+    pub fn freeze_for(env: Env, caller: Address, ledgers: u32) -> Result<u32, Error> {
+        Self::require_admin_or_guardian(&env, &caller)?;
+        let requested = env.ledger().sequence().saturating_add(ledgers);
+        let existing: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FrozenUntil)
+            .unwrap_or(0);
+        let until_ledger = requested.max(existing);
+        env.storage()
+            .instance()
+            .set(&DataKey::FrozenUntil, &until_ledger);
+        Self::extend_instance_ttl(&env);
+        TimedFrozen {
+            caller: caller.clone(),
+            until_ledger,
+        }
+        .publish(&env);
+        Ok(until_ledger)
+    }
+
+    /// Freeze a single operation `scope` (e.g. `mint`, `transfer`). Callable
+    /// by the admin or any guardian. Consumers check it with
+    /// `is_frozen_scope`; the global freeze still overrides every scope.
+    pub fn freeze_scope(env: Env, caller: Address, scope: Symbol) -> Result<(), Error> {
+        Self::require_admin_or_guardian(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::FrozenScope(scope.clone()), &true);
+        Self::extend_instance_ttl(&env);
+        ScopeFrozen { caller, scope }.publish(&env);
+        Ok(())
+    }
+
+    /// Unfreeze a single operation `scope`. Admin-only, mirroring `unfreeze`.
+    /// Unfreezing a scope that is not frozen is a no-op.
+    pub fn unfreeze_scope(env: Env, admin: Address, scope: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let key = DataKey::FrozenScope(scope.clone());
+        if !env.storage().instance().has(&key) {
+            return Ok(());
+        }
+        env.storage().instance().remove(&key);
+        Self::extend_instance_ttl(&env);
+        ScopeUnfrozen { admin, scope }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns `Ok(true)` if `scope` is frozen, either directly via
+    /// `freeze_scope` or because the global freeze (permanent or timed) is
+    /// active. Returns `Err(Error::NotInitialized)` before `initialize`.
+    pub fn is_frozen_scope(env: Env, scope: Symbol) -> Result<bool, Error> {
+        if Self::is_frozen(env.clone())? {
+            return Ok(true);
+        }
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::FrozenScope(scope))
+            .unwrap_or(false))
+    }
+
     /// Unfreeze is admin-only: resuming flows is deliberately harder than
     /// halting them, so a guardian cannot reopen a frozen system.
     pub fn unfreeze(env: Env, admin: Address) -> Result<(), Error> {
@@ -245,11 +349,13 @@ impl CircuitBreaker {
             .instance()
             .get(&DataKey::Frozen)
             .unwrap_or(false);
-        if !currently_frozen {
+        let timed_frozen = Self::timed_freeze_active(&env);
+        if !currently_frozen && !timed_frozen {
             return Ok(());
         }
         env.storage().instance().set(&DataKey::Frozen, &false);
         env.storage().instance().remove(&DataKey::FrozenSince);
+        env.storage().instance().remove(&DataKey::FrozenUntil);
         Self::extend_instance_ttl(&env);
         Unfrozen {
             admin: admin.clone(),
@@ -275,11 +381,12 @@ impl CircuitBreaker {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
-        Ok(env
+        let frozen: bool = env
             .storage()
             .instance()
             .get(&DataKey::Frozen)
-            .unwrap_or(false))
+            .unwrap_or(false);
+        Ok(frozen || Self::timed_freeze_active(&env))
     }
 
     /// Returns the ledger sequence number when the breaker was frozen, or
@@ -315,11 +422,15 @@ impl CircuitBreaker {
     }
 
     /// Add `guardian` to the freeze-only set. Admin-only. Adding an existing
-    /// guardian is a no-op.
+    /// guardian is a no-op. Fails with `Error::TooManyGuardians` once
+    /// [`MAX_GUARDIANS`] guardians are configured.
     pub fn add_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         let mut guardians = Self::guardians(&env);
         if !Self::contains(&guardians, &guardian) {
+            if guardians.len() >= MAX_GUARDIANS {
+                return Err(Error::TooManyGuardians);
+            }
             guardians.push_back(guardian.clone());
             env.storage().instance().set(&DataKey::Guardians, &guardians);
             GuardianAdded {
@@ -355,6 +466,11 @@ impl CircuitBreaker {
 
     pub fn is_guardian(env: Env, address: Address) -> bool {
         Self::contains(&Self::guardians(&env), &address)
+    }
+
+    /// Returns every configured guardian, in insertion order.
+    pub fn list_guardians(env: Env) -> Vec<Address> {
+        Self::guardians(&env)
     }
 
     /// Propose a new admin. The current admin remains fully in control
@@ -446,6 +562,21 @@ impl CircuitBreaker {
             version: String::from_str(&env, env!("CARGO_PKG_VERSION")),
             admin,
         })
+    }
+
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
+
+    fn timed_freeze_active(env: &Env) -> bool {
+        let until: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FrozenUntil)
+            .unwrap_or(0);
+        env.ledger().sequence() < until
     }
 
     fn guardians(env: &Env) -> Vec<Address> {
