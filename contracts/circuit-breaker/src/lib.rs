@@ -469,3 +469,6 @@ impl CircuitBreaker {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod fuzz;

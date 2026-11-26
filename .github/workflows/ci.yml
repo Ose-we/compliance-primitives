@@ -270,6 +270,33 @@ jobs:
       - name: Check CHANGELOG.md and version are in sync
         run: ./scripts/check-changelog.sh
 
+  per-contract-changelog:
+    name: per-contract changelog check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full history to build the changelog.
+          fetch-depth: 0
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+      - name: Regenerate per-contract changelog sections
+        run: ./scripts/generate-contract-changelogs.sh
+      - name: Check for differences
+        run: |
+          # `git status --porcelain` also catches untracked files (e.g. a new
+          # contract whose changelog section was generated but never committed).
+          if [ -z "$(git status --porcelain CHANGELOG.md)" ]; then
+            echo "✓ per-contract CHANGELOG sections are up to date"
+          else
+            echo "✗ CHANGELOG.md is out of date. Run ./scripts/generate-contract-changelogs.sh and commit the changes."
+            git status --porcelain CHANGELOG.md
+            git diff CHANGELOG.md
+            exit 1
+          fi
+
   contract-line-count:
     name: contract line-count guideline check
     runs-on: ubuntu-latest

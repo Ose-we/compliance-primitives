@@ -135,9 +135,38 @@ stellar contract invoke \
   -- is_frozen
 ```
 
+## Publishing deployed IDs
+
+The README carries a table of deployed testnet contract IDs per release so
+developers can try the contracts without deploying their own. That table is
+generated, not hand-edited.
+
+`scripts/deploy-full-stack-testnet.sh` writes the IDs it deploys to
+`testnet-ids.json` at the repo root, then runs
+`scripts/update-testnet-ids.mjs`, which rewrites the table in `README.md`
+from that file. So a normal deploy run keeps the README in sync
+automatically — no manual copy-paste of contract IDs.
+
+To refresh the table without deploying (e.g. after editing
+`testnet-ids.json` by hand, or to check a PR that touched it):
+
+```sh
+node scripts/update-testnet-ids.mjs
+```
+
+To verify the README is up to date without writing anything — useful in CI
+or before committing — pass `--check`:
+
+```sh
+node scripts/update-testnet-ids.mjs --check
+```
+
+It exits non-zero if the README table doesn't match `testnet-ids.json`.
+
 ## Redeploying after a testnet reset
 
 Testnet resets periodically. Re-run
-`scripts/deploy-full-stack-testnet.sh` and update any contract IDs you've
-recorded elsewhere (e.g. in your own notes or a `.env` file) — this script
-doesn't persist IDs anywhere itself, it only prints them.
+`scripts/deploy-full-stack-testnet.sh` — it redeploys everything, rewrites
+`testnet-ids.json`, and refreshes the README table in one go. Update any
+contract IDs you've recorded elsewhere (e.g. in your own notes or a `.env`
+file) yourself.
