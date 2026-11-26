@@ -235,6 +235,8 @@ pub trait AuditLogInterface {
 pub struct DenyAdd {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 /// Emitted alongside [`DenyAdd`] when an entry is tagged with its source list.
@@ -259,6 +261,8 @@ pub struct DenylistEntry {
 pub struct DenyRemove {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 /// Emitted when the optional audit-log write fails (paused, archived, or
@@ -807,6 +811,7 @@ impl DenylistGate {
 
         DenyAdd {
             address: address.clone(),
+            by: admin.clone(),
         }
         .publish(env);
         if let Some(source) = source {
@@ -834,6 +839,7 @@ impl DenylistGate {
         Self::remove_entry(&env, &address);
         DenyRemove {
             address: address.clone(),
+            by: caller,
         }
         .publish(&env);
         Self::record_audit(&env, Symbol::new(&env, "deny_remove"), &address, "address removed from denylist");
@@ -869,7 +875,7 @@ impl DenylistGate {
 
         for address in addresses.iter() {
             Self::remove_entry(&env, &address);
-            DenyRemove { address }.publish(&env);
+            DenyRemove { address, by: admin.clone() }.publish(&env);
         }
         Ok(())
     }
@@ -1220,6 +1226,7 @@ impl DenylistGate {
                     .remove(&DataKey::DeniedSource(address.clone()));
                 DenyAdd {
                     address: address.clone(),
+                    by: env.current_contract_address(),
                 }
                 .publish(env);
                 Self::record_audit(
@@ -1233,6 +1240,7 @@ impl DenylistGate {
                 Self::remove_entry(env, &address);
                 DenyRemove {
                     address: address.clone(),
+                    by: env.current_contract_address(),
                 }
                 .publish(env);
                 Self::record_audit(

@@ -166,12 +166,16 @@ pub struct AllowlistEntryInfo {
 pub struct AllowAdd {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 #[contractevent]
 pub struct AllowRemove {
     #[topic]
     pub address: Address,
+    /// Admin or compliance officer that authorized the change.
+    pub by: Address,
 }
 
 /// Emitted when an admin or compliance officer freezes `address`.
@@ -467,7 +471,7 @@ impl AllowlistToken {
             }
         }
         Self::write_allowlist_entry(&env, &address, expiration_ledger, &admin);
-        AllowAdd { address }.publish(&env);
+        AllowAdd { address, by: admin }.publish(&env);
         Ok(())
     }
 
@@ -507,7 +511,7 @@ impl AllowlistToken {
 
         for address in addresses.iter() {
             Self::write_allowlist_entry(&env, &address, expiration_ledger, &admin);
-            AllowAdd { address }.publish(&env);
+            AllowAdd { address, by: admin.clone() }.publish(&env);
         }
         Ok(())
     }
@@ -576,7 +580,7 @@ impl AllowlistToken {
             Err(_) => return Err(Error::NotAuthorized),
         }
         Self::write_allowlist_entry(&env, &address, None, &admin);
-        AllowAdd { address }.publish(&env);
+        AllowAdd { address, by: admin }.publish(&env);
         Ok(())
     }
 
@@ -590,7 +594,7 @@ impl AllowlistToken {
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
-        Self::remove_allowed_if_present(&env, address);
+        Self::remove_allowed_if_present(&env, address, &admin);
         Ok(())
     }
 
@@ -612,7 +616,7 @@ impl AllowlistToken {
         }
 
         for address in addresses.iter() {
-            Self::remove_allowed_if_present(&env, address);
+            Self::remove_allowed_if_present(&env, address, &admin);
         }
         Ok(())
     }
@@ -1517,14 +1521,18 @@ impl AllowlistToken {
 
     /// Removes the allowlist entry for `address` and emits `AllowRemove`, but
     /// only if an entry exists. Absent addresses are left untouched.
-    fn remove_allowed_if_present(env: &Env, address: Address) {
+    fn remove_allowed_if_present(env: &Env, address: Address, by: &Address) {
         let key = DataKey::Allowed(address.clone());
         if env.storage().persistent().has(&key) {
             Self::remove_allowlist_entry(env, &address);
             env.storage()
                 .persistent()
                 .remove(&DataKey::AllowedProvenance(address.clone()));
-            AllowRemove { address }.publish(env);
+            AllowRemove {
+                address,
+                by: by.clone(),
+            }
+            .publish(env);
         }
     }
 

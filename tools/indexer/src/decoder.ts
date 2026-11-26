@@ -10,12 +10,12 @@
  *
  * For primitive and circuit-breaker events:
  *
- *   AllowAdd        topics: [Symbol("allow_add"), Address]          data: {}
- *   AllowRemove     topics: [Symbol("allow_remove"), Address]        data: {}
+ *   AllowAdd        topics: [Symbol("allow_add"), Address]          data: { by: Address }
+ *   AllowRemove     topics: [Symbol("allow_remove"), Address]        data: { by: Address }
  *   Blocked         topics: [Symbol("blocked"), Address, Address]   data: { amount: I128 }
- *   DenyAdd         topics: [Symbol("deny_add"), Address]            data: {}
- *   DenyRemove      topics: [Symbol("deny_remove"), Address]         data: {}
- *   JurisdictionSet topics: [Symbol("jurisdiction_set"), Address]    data: { code: String }
+ *   DenyAdd         topics: [Symbol("deny_add"), Address]            data: { by: Address }
+ *   DenyRemove      topics: [Symbol("deny_remove"), Address]         data: { by: Address }
+ *   JurisdictionSet topics: [Symbol("jurisdiction_set"), Address]    data: { code: String, previous: Vec<String> }
  *   Frozen          topics: [Symbol("frozen"), Address(admin)]       data: {}
  *   Unfrozen        topics: [Symbol("unfrozen"), Address(admin)]     data: {}
  *

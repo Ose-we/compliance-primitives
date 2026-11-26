@@ -455,7 +455,7 @@ fn test_transfer_blocked_when_recipient_not_allowlisted() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_add"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
             (
                 contract_id.clone(),
@@ -629,7 +629,7 @@ fn test_remove_from_allowlist_never_added_is_noop() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_remove"), never_added.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -698,7 +698,7 @@ fn test_add_to_allowlist_emits_allow_add_event() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_add"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
@@ -720,12 +720,12 @@ fn test_remove_from_allowlist_emits_allow_remove_event() {
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_add"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
             (
                 contract_id.clone(),
                 (Symbol::new(&env, "allow_remove"), alice.clone()).into_val(&env),
-                Map::<Symbol, Val>::new(&env).into_val(&env),
+                Map::<Symbol, Val>::from_array(&env, [(Symbol::new(&env, "by"), admin.to_val())]).into_val(&env),
             ),
         ]
     );
