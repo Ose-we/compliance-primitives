@@ -21,6 +21,7 @@ A configurable policy composition contract that evaluates denylist and jurisdict
 | `get_policy(name)` | Read a named policy, including its `policy_version` and `max_checks`. |
 | `get_checks(name)` | Read the configured checks for a named policy. |
 | `get_op(name)` | Read whether the named policy's checks are combined with all/any semantics. |
+| `is_paused()` | Read whether the policy engine is currently paused. |
 
 ## Multiple named policies
 

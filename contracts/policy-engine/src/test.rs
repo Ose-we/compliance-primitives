@@ -745,6 +745,19 @@ fn test_get_admin_not_initialized_returns_error() {
     );
 }
 
+/// `is_paused` reflects the shared pausable state.
+#[test]
+fn test_is_paused_returns_current_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, engine_id, client) = setup_engine_all(&env);
+
+    assert!(!client.is_paused());
+
+    env.as_contract(&engine_id, || compliance_pausable::pause(&env));
+    assert!(client.is_paused());
+}
+
 // ---------------------------------------------------------------------------
 // Tests for issue #405: evaluate_verbose surfaces CheckFailure
 // ---------------------------------------------------------------------------
