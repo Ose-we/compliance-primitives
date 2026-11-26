@@ -1303,3 +1303,193 @@ fn test_clear_jurisdiction_flag_emits_event_with_previous() {
     agg_client.clear_jurisdiction_flag(&agg_admin);
     assert_eq!(env.events().all().len(), count);
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end: composing all primitives including pause and freeze states
+// ---------------------------------------------------------------------------
+
+/// Full-stack end-to-end test: registers both a denylist-gate and a
+/// jurisdiction-flag in the aggregator and verifies combined outcomes
+/// across all four quadrants of the truth table, plus pause and freeze
+/// short-circuit states (issue #818).
+#[test]
+fn test_e2e_all_primitives_combined_outcomes() {
+    let env = Env::default();
+    let (gate_admin, gate_id, flag_issuer, flag_id, agg_admin, _, client) = setup_all(&env);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    // Set allowed jurisdiction codes on the flag contract.
+    let allowed = vec![&env, String::from_str(&env, "US")];
+
+    // Neither address is on the denylist or has a jurisdiction set yet.
+    // With both checks registered but no jurisdiction set,
+    // jurisdiction check passes (no codes = not restricted).
+    let (all_passed, results) = client.check_address(&alice, &allowed);
+    assert!(all_passed, "both checks pass for clean address");
+    assert_eq!(results.len(), 2);
+
+    // Deny alice — denylist check fails, jurisdiction still passes.
+    deny(&env, &gate_id, &gate_admin, &alice);
+    let (all_passed, results) = client.check_address(&alice, &allowed);
+    assert!(!all_passed, "denied address should not pass");
+    let deny_result = results.iter().find(|r| r.check == CheckKind::DenylistGate);
+    assert!(deny_result.is_some());
+    assert!(!deny_result.unwrap().passed, "denylist check should fail for alice");
+
+    // Remove alice from denylist; now both pass again.
+    DenylistGateClient::new(&env, &gate_id).remove_from_denylist(&gate_admin, &alice);
+    let (all_passed, _) = client.check_address(&alice, &allowed);
+    assert!(all_passed, "both checks pass after removing from denylist");
+
+    // Set bob's jurisdiction to a blocked code (not in allowed list).
+    set_jurisdiction(&env, &flag_id, &flag_issuer, &bob, "CN");
+    let (all_passed, results) = client.check_address(&bob, &allowed);
+    assert!(!all_passed, "wrong jurisdiction should not pass");
+    let jur_result = results.iter().find(|r| r.check == CheckKind::JurisdictionFlag);
+    assert!(jur_result.is_some());
+    assert!(!jur_result.unwrap().passed, "jurisdiction check should fail for bob");
+
+    // Set bob's jurisdiction to an allowed code — both checks pass.
+    set_jurisdiction(&env, &flag_id, &flag_issuer, &bob, "US");
+    let (all_passed, _) = client.check_address(&bob, &allowed);
+    assert!(all_passed, "correct jurisdiction passes");
+
+    // Deny bob and give him a bad jurisdiction at the same time — both fail.
+    deny(&env, &gate_id, &gate_admin, &bob);
+    set_jurisdiction(&env, &flag_id, &flag_issuer, &bob, "CN");
+    let (all_passed, results) = client.check_address(&bob, &allowed);
+    assert!(!all_passed, "both checks fail simultaneously");
+    for r in results.iter() {
+        match r.check {
+            CheckKind::DenylistGate => assert!(!r.passed, "denylist should fail"),
+            CheckKind::JurisdictionFlag => assert!(!r.passed, "jurisdiction should fail"),
+            _ => {}
+        }
+    }
+}
+
+/// Verifies that `check_all` aggregates combined outcomes across a batch
+/// of addresses, including mixed pass/fail states, covering issue #818.
+#[test]
+fn test_e2e_check_all_combined_outcomes() {
+    let env = Env::default();
+    let (gate_admin, gate_id, flag_issuer, flag_id, _, _, client) = setup_all(&env);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+
+    let allowed = vec![&env, String::from_str(&env, "US")];
+    let addresses = vec![&env, alice.clone(), bob.clone(), carol.clone()];
+
+    // alice: clean
+    // bob: denied
+    // carol: bad jurisdiction
+    deny(&env, &gate_id, &gate_admin, &bob);
+    set_jurisdiction(&env, &flag_id, &flag_issuer, &carol, "CN");
+
+    let results = client.check_all(&addresses, &allowed);
+    assert_eq!(results.len(), 3);
+
+    let alice_res = results.iter().find(|r| r.address == alice).unwrap();
+    let bob_res = results.iter().find(|r| r.address == bob).unwrap();
+    let carol_res = results.iter().find(|r| r.address == carol).unwrap();
+
+    assert!(alice_res.all_passed, "alice should pass all checks");
+    assert!(!bob_res.all_passed, "denied bob should not pass");
+    assert!(!carol_res.all_passed, "wrong-jurisdiction carol should not pass");
+}
+
+/// Verifies that the aggregator's pause state short-circuits all mutations
+/// while still allowing read-only checks (issue #818).
+#[test]
+fn test_e2e_pause_state_blocks_mutations() {
+    let env = Env::default();
+    let (_, gate_id, _, _, agg_admin, _, client) = setup_all(&env);
+
+    // Pause the aggregator.
+    client.pause(&agg_admin);
+    assert!(client.is_paused());
+
+    // Admin mutations are blocked while paused.
+    let new_gate = env.register(DenylistGate, ());
+    let res = client.try_set_denylist_gate(&agg_admin, &new_gate);
+    assert_eq!(res, Err(Ok(Error::ContractPaused)));
+
+    // Check reads are allowed even while paused.
+    let alice = Address::generate(&env);
+    let allowed = vec![&env, String::from_str(&env, "US")];
+    // check_address itself calls the underlying primitives; since the
+    // aggregator is paused (not the primitives), the read still succeeds.
+    let (all_passed, _) = client.check_address(&alice, &allowed);
+    assert!(all_passed, "read check still works while aggregator is paused");
+
+    // Unpause and confirm mutations are unblocked.
+    client.unpause(&agg_admin);
+    assert!(!client.is_paused());
+    client.set_denylist_gate(&agg_admin, &gate_id); // should not panic
+}
+
+/// Verifies that a configured circuit-breaker in the frozen state short-circuits
+/// all check results to failing, independent of denylist/jurisdiction state
+/// (issue #818).
+#[test]
+fn test_e2e_freeze_state_short_circuits_all_checks() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let gate_admin = Address::generate(&env);
+    let gate_id = env.register(DenylistGate, ());
+    DenylistGateClient::new(&env, &gate_id).initialize(&gate_admin);
+
+    let flag_issuer = Address::generate(&env);
+    let flag_id = env.register(JurisdictionFlag, ());
+    JurisdictionFlagClient::new(&env, &flag_id).initialize(&flag_issuer);
+
+    let breaker_admin = Address::generate(&env);
+    let breaker_id = env.register(CircuitBreaker, ());
+    let breaker_client = CbClient::new(&env, &breaker_id);
+    breaker_client.initialize(&breaker_admin);
+
+    let agg_admin = Address::generate(&env);
+    let agg_id = env.register(ComplianceAggregator, ());
+    let client = ComplianceAggregatorClient::new(&env, &agg_id);
+    client.initialize(
+        &agg_admin,
+        &Some(gate_id.clone()),
+        &Some(flag_id.clone()),
+        &Some(breaker_id.clone()),
+    );
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let allowed = vec![&env, String::from_str(&env, "US")];
+
+    // Both addresses start clean — circuit not frozen.
+    let (all_passed, _) = client.check_address(&alice, &allowed);
+    assert!(all_passed, "passes before freeze");
+
+    // Freeze the circuit breaker.
+    breaker_client.freeze(&breaker_admin, &None);
+
+    // Both addresses now fail regardless of denylist/jurisdiction state.
+    let (all_passed, checks) = client.check_address(&alice, &allowed);
+    assert!(!all_passed, "frozen circuit short-circuits alice");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks.get(0).unwrap().check, CheckKind::CircuitBreaker);
+    assert!(!checks.get(0).unwrap().passed);
+
+    // batch check also short-circuits
+    let addresses = vec![&env, alice.clone(), bob.clone()];
+    let batch = client.check_all(&addresses, &allowed);
+    for r in batch.iter() {
+        assert!(!r.all_passed, "every address fails under freeze");
+    }
+
+    // Unfreeze and confirm everything passes again.
+    breaker_client.unfreeze(&breaker_admin);
+    let (all_passed, _) = client.check_address(&alice, &allowed);
+    assert!(all_passed, "passes after unfreeze");
+}
