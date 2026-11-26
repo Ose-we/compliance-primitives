@@ -20,6 +20,24 @@
 //! can't be flagged as `"us"` and then silently fail to match an
 //! `allowed_codes` entry of `"US"`.
 //!
+//! **Known codes (#775)**: the two letters must also be an officially
+//! assigned ISO 3166-1 alpha-2 code, checked against an embedded 676-bit
+//! bitmap ([`ISO_3166_1_BITMAP`]), so typos like `"UK"` or `"XX"` are
+//! rejected instead of being stored and never matching policy.
+//!
+//! **Subdivisions (#774)**: ISO 3166-2 codes of the form `CC-SSS` (a known
+//! country code, a hyphen, then 1–3 uppercase ASCII letters or digits, e.g.
+//! `"US-NY"`, `"GB-ENG"`, `"FR-75"`) are also accepted. By default a
+//! permitted country implies its subdivisions: `allowed_codes = ["US"]`
+//! permits an address flagged `"US-NY"`. The issuer can disable this with
+//! `set_subdivision_inheritance(issuer, false)`, after which matching is
+//! exact only.
+//!
+//! **Cooldown (#777)**: the issuer may configure a per-address cooldown (in
+//! ledgers) via `set_jurisdiction_cooldown`. While non-zero, a jurisdiction
+//! change for an address within `cooldown` ledgers of its previous change is
+//! rejected with `Error::JurisdictionCooldownActive`. Removals are exempt.
+//!
 //! **Callers**: the configured issuer or compliance officer may call
 //! `set_jurisdiction`, `set_jurisdiction_until`, `add_jurisdiction`, and
 //! `set_multiple_jurisdictions`; only the issuer may call
@@ -37,6 +55,22 @@ use soroban_sdk::{
 
 /// Length in bytes of an ISO 3166-1 alpha-2 code.
 const JURISDICTION_CODE_LEN: u32 = 2;
+/// Maximum length of an ISO 3166-2 subdivision code (`CC-SSS`).
+const SUBDIVISION_CODE_MAX_LEN: u32 = 6;
+
+/// Bitmap of officially assigned ISO 3166-1 alpha-2 codes (249 entries).
+/// Bit `(a - 'A') * 26 + (b - 'A')` is set when code `ab` is assigned.
+/// A constant-time lookup keeps validation cost flat (#775).
+pub const ISO_3166_1_BITMAP: [u32; 22] = [
+    0xEEDF5978, 0xDEDDBDEF, 0x15843F27, 0x0E00D480, 0xB0095C00, 0x0015FB9F, 0x7818068D, 0x0340400F, 0xF42B1D00, 0xFD4F8141, 0x25D7FFFC, 0x0100084B, 0x538F3C40, 0x40000001, 0xFDF15100, 0x9FBB3AE7, 0x0410419A, 0x00408557, 0x00004002, 0x00100000, 0x00400408, 0x00000001,
+];
+
+/// Returns `true` if `code` is an officially assigned ISO 3166-1 alpha-2
+/// code. `code` must already be two uppercase ASCII letters.
+fn is_known_country(code: [u8; 2]) -> bool {
+    let idx = (code[0] - b'A') as usize * 26 + (code[1] - b'A') as usize;
+    ISO_3166_1_BITMAP[idx / 32] & (1u32 << (idx % 32)) != 0
+}
 
 /// Extend persistent jurisdiction entries below 120,960 ledgers (~7 days).
 const TTL_THRESHOLD: u32 = 120_960;
@@ -83,6 +117,13 @@ enum DataKey {
     PendingIssuer,
     /// Pending issuer-authorized WASM upgrade proposal. Instance storage.
     PendingUpgrade,
+    /// When `true`, a permitted country does NOT imply its subdivisions.
+    /// Absent / `false` = subdivisions inherit (default). Instance storage.
+    StrictSubdivisions,
+    /// Per-address jurisdiction-change cooldown in ledgers. Instance storage.
+    Cooldown,
+    /// Ledger sequence of the address's last jurisdiction change. Persistent.
+    LastChange(Address),
 }
 
 /// Emitted whenever a jurisdiction flag is set.
@@ -200,6 +241,9 @@ pub enum Error {
     /// `add_jurisdiction` was called when the address already has
     /// [`MAX_CODES_PER_ADDRESS`] codes attached.
     TooManyCodes = 10,
+    /// A jurisdiction change was attempted for an address before its
+    /// configured cooldown elapsed (#777).
+    JurisdictionCooldownActive = 11,
 }
 
 #[contract]
@@ -447,6 +491,7 @@ impl JurisdictionFlag {
         Self::require_compliance_authority(&env, &issuer)?;
         Self::reject_if_paused(&env)?;
         Self::validate_jurisdiction_code(&code)?;
+        Self::check_cooldown(&env, &address)?;
 
         let mut codes = Vec::new(&env);
         codes.push_back(code.clone());
@@ -454,6 +499,7 @@ impl JurisdictionFlag {
         env.storage()
             .persistent()
             .remove(&DataKey::ValidUntil(address.clone()));
+        Self::record_change(&env, &address);
 
         JurisdictionSet {
             address,
@@ -487,8 +533,9 @@ impl JurisdictionFlag {
         if entries.is_empty() || entries.len() > MAX_BATCH_SIZE {
             return Err(Error::InvalidInput);
         }
-        for (_, code) in entries.iter() {
+        for (address, code) in entries.iter() {
             Self::validate_jurisdiction_code(&code)?;
+            Self::check_cooldown(&env, &address)?;
         }
 
         for (address, code) in entries.iter() {
@@ -498,9 +545,109 @@ impl JurisdictionFlag {
             env.storage()
                 .persistent()
                 .remove(&DataKey::ValidUntil(address.clone()));
+            Self::record_change(&env, &address);
             JurisdictionSet { address, code }.publish(&env);
         }
         Ok(())
+    }
+
+    /// Batch variant of [`set_jurisdiction_until`](Self::set_jurisdiction_until)
+    /// for onboarding cohorts that share the same expiry (#776).
+    ///
+    /// Each address's codes are replaced by its single given code, valid
+    /// through ledger `valid_until` (inclusive). `caller` must be the issuer
+    /// or the compliance officer. All inputs are validated **before** any
+    /// writes, so one bad entry rejects the whole batch.
+    ///
+    /// # Errors
+    /// [`Error::ContractPaused`] while paused; [`Error::InvalidInput`] if
+    /// `entries` is empty, longer than [`MAX_BATCH_SIZE`], or `valid_until`
+    /// is in the past; [`Error::InvalidJurisdictionCode`] if any code is
+    /// malformed; [`Error::JurisdictionCooldownActive`] if any address is
+    /// still within its cooldown.
+    pub fn set_multiple_jurisdictions_until(
+        env: Env,
+        caller: Address,
+        entries: Vec<(Address, String)>,
+        valid_until: u32,
+    ) -> Result<(), Error> {
+        Self::require_compliance_authority(&env, &caller)?;
+        Self::reject_if_paused(&env)?;
+
+        if entries.is_empty() || entries.len() > MAX_BATCH_SIZE {
+            return Err(Error::InvalidInput);
+        }
+        if valid_until < env.ledger().sequence() {
+            return Err(Error::InvalidInput);
+        }
+        for (address, code) in entries.iter() {
+            Self::validate_jurisdiction_code(&code)?;
+            Self::check_cooldown(&env, &address)?;
+        }
+
+        for (address, code) in entries.iter() {
+            let mut codes = Vec::new(&env);
+            codes.push_back(code.clone());
+            Self::store_jurisdictions(&env, &address, &codes);
+            let until_key = DataKey::ValidUntil(address.clone());
+            env.storage().persistent().set(&until_key, &valid_until);
+            Self::extend_jurisdiction_ttl(&env, &until_key);
+            Self::record_change(&env, &address);
+            JurisdictionSet { address, code }.publish(&env);
+        }
+        Ok(())
+    }
+
+    /// Configure whether a permitted country implies its ISO 3166-2
+    /// subdivisions in [`is_permitted_jurisdiction`](Self::is_permitted_jurisdiction)
+    /// (#774). Defaults to `true`. Issuer-only.
+    pub fn set_subdivision_inheritance(
+        env: Env,
+        issuer: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        Self::require_issuer(&env, &issuer)?;
+        if enabled {
+            env.storage().instance().remove(&DataKey::StrictSubdivisions);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::StrictSubdivisions, &true);
+        }
+        Ok(())
+    }
+
+    /// Return whether a permitted country implies its subdivisions.
+    pub fn get_subdivision_inheritance(env: Env) -> bool {
+        !env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::StrictSubdivisions)
+            .unwrap_or(false)
+    }
+
+    /// Configure the per-address cooldown, in ledgers, between jurisdiction
+    /// changes for the same address (#777). `0` disables the cooldown
+    /// (default). Issuer-only.
+    pub fn set_jurisdiction_cooldown(
+        env: Env,
+        issuer: Address,
+        ledgers: u32,
+    ) -> Result<(), Error> {
+        Self::require_issuer(&env, &issuer)?;
+        if ledgers == 0 {
+            env.storage().instance().remove(&DataKey::Cooldown);
+        } else {
+            env.storage().instance().set(&DataKey::Cooldown, &ledgers);
+        }
+        Ok(())
+    }
+
+    /// Return the configured per-address cooldown in ledgers (`0` = none).
+    pub fn get_jurisdiction_cooldown(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Cooldown)
+            .unwrap_or(0)
     }
 
     /// Attach jurisdiction `code` to `address`, valid through ledger
@@ -522,6 +669,7 @@ impl JurisdictionFlag {
         if valid_until < env.ledger().sequence() {
             return Err(Error::InvalidInput);
         }
+        Self::check_cooldown(&env, &address)?;
 
         let mut codes = Vec::new(&env);
         codes.push_back(code.clone());
@@ -529,6 +677,7 @@ impl JurisdictionFlag {
         let until_key = DataKey::ValidUntil(address.clone());
         env.storage().persistent().set(&until_key, &valid_until);
         Self::extend_jurisdiction_ttl(&env, &until_key);
+        Self::record_change(&env, &address);
 
         JurisdictionSet { address, code }.publish(&env);
         Ok(())
@@ -556,8 +705,10 @@ impl JurisdictionFlag {
             if codes.len() >= MAX_CODES_PER_ADDRESS {
                 return Err(Error::TooManyCodes);
             }
+            Self::check_cooldown(&env, &address)?;
             codes.push_back(code.clone());
             Self::store_jurisdictions(&env, &address, &codes);
+            Self::record_change(&env, &address);
         }
 
         JurisdictionSet { address, code }.publish(&env);
@@ -646,9 +797,19 @@ impl JurisdictionFlag {
             return Err(Error::EmptyAllowedCodes);
         }
         let codes = Self::load_active_jurisdictions(&env, &address);
-        Ok(allowed_codes
-            .iter()
-            .any(|allowed| codes.iter().any(|code| code == allowed)))
+        if codes.is_empty() {
+            return Ok(false);
+        }
+        let inherit = !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::StrictSubdivisions)
+            .unwrap_or(false);
+        Ok(allowed_codes.iter().any(|allowed| {
+            codes.iter().any(|code| {
+                code == allowed || (inherit && Self::is_subdivision_of(&code, &allowed))
+            })
+        }))
     }
 
     /// Unified compliance check — returns `true` if `address` has **any**
@@ -793,17 +954,83 @@ impl JurisdictionFlag {
         Err(Error::NotAuthorized)
     }
 
-    /// Accepts only exactly two uppercase ASCII letters (`A`–`Z`).
+    /// Accepts an assigned ISO 3166-1 alpha-2 code (`"US"`) or an ISO
+    /// 3166-2 subdivision code `CC-SSS` whose country part is assigned and
+    /// whose subdivision part is 1–3 uppercase ASCII letters or digits.
     fn validate_jurisdiction_code(code: &String) -> Result<(), Error> {
-        if code.len() != JURISDICTION_CODE_LEN {
+        let len = code.len();
+        if len != JURISDICTION_CODE_LEN
+            && !(len >= JURISDICTION_CODE_LEN + 2 && len <= SUBDIVISION_CODE_MAX_LEN)
+        {
             return Err(Error::InvalidJurisdictionCode);
         }
-        let mut buf = [0u8; JURISDICTION_CODE_LEN as usize];
-        code.copy_into_slice(&mut buf);
-        if !buf.iter().all(u8::is_ascii_uppercase) {
+        let mut buf = [0u8; SUBDIVISION_CODE_MAX_LEN as usize];
+        let buf = &mut buf[..len as usize];
+        code.copy_into_slice(buf);
+        let country = [buf[0], buf[1]];
+        if !country.iter().all(u8::is_ascii_uppercase) || !is_known_country(country) {
             return Err(Error::InvalidJurisdictionCode);
+        }
+        if len > JURISDICTION_CODE_LEN {
+            let sub = &buf[3..];
+            if buf[2] != b'-'
+                || !sub
+                    .iter()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                return Err(Error::InvalidJurisdictionCode);
+            }
         }
         Ok(())
+    }
+
+    /// `true` if `code` is a subdivision (`CC-…`) of country `allowed` (`CC`).
+    fn is_subdivision_of(code: &String, allowed: &String) -> bool {
+        if allowed.len() != JURISDICTION_CODE_LEN || code.len() <= JURISDICTION_CODE_LEN + 1 {
+            return false;
+        }
+        if code.len() > SUBDIVISION_CODE_MAX_LEN {
+            return false;
+        }
+        let mut c = [0u8; SUBDIVISION_CODE_MAX_LEN as usize];
+        code.copy_into_slice(&mut c[..code.len() as usize]);
+        let mut a = [0u8; JURISDICTION_CODE_LEN as usize];
+        allowed.copy_into_slice(&mut a);
+        c[0] == a[0] && c[1] == a[1] && c[2] == b'-'
+    }
+
+    /// Rejects a change for `address` while its cooldown is still running.
+    fn check_cooldown(env: &Env, address: &Address) -> Result<(), Error> {
+        let cooldown: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Cooldown)
+            .unwrap_or(0);
+        if cooldown == 0 {
+            return Ok(());
+        }
+        if let Some(last) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::LastChange(address.clone()))
+        {
+            if env.ledger().sequence() < last.saturating_add(cooldown) {
+                return Err(Error::JurisdictionCooldownActive);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the ledger of `address`'s latest change when a cooldown is
+    /// configured (no storage cost otherwise).
+    fn record_change(env: &Env, address: &Address) {
+        if env.storage().instance().has(&DataKey::Cooldown) {
+            let key = DataKey::LastChange(address.clone());
+            env.storage()
+                .persistent()
+                .set(&key, &env.ledger().sequence());
+            Self::extend_jurisdiction_ttl(env, &key);
+        }
     }
 
     fn extend_jurisdiction_ttl(env: &Env, key: &DataKey) {
