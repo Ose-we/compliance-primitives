@@ -70,9 +70,59 @@
 //! circuit-breaker contract itself. The two mechanisms are kept separate to
 //! avoid conflating operational pause (admin maintenance window) with
 //! emergency freeze (halt-all-transfers signal).
+//!
+//! ## Pauser role: hot/cold key separation (issue #806)
+//!
+//! Requiring the admin key to pause slows incident response: the admin key is
+//! typically a cold key (hardware wallet, multisig, or offline signer) and
+//! bringing it online mid-incident is slow. This crate therefore supports an
+//! optional **pauser** role — a hot key that can *only* pause, never unpause.
+//!
+//! - [`set_pauser`] / [`clear_pauser`] are **admin-only** operations. The
+//!   consuming contract must authenticate the admin before calling them; this
+//!   crate does not know the admin `Address`.
+//! - [`pause_authorized`] lets a caller pause when it is either the admin or
+//!   the configured pauser.
+//! - [`unpause`] remains **admin-only** — the pauser can never resume the
+//!   contract, so a compromised hot key can halt operations but cannot
+//!   unilaterally restore them.
+//!
+//! ### Recommended key setup
+//!
+//! | Key | Storage | Purpose |
+//! |---|---|---|
+//! | Admin | cold (multisig / hardware / offline) | Unpause, rotate or clear the pauser, all other privileged ops |
+//! | Pauser | hot (server-side signer, on-call automation) | Pause only |
+//!
+//! Operational guidance:
+//!
+//! 1. Keep the admin key cold and use it only for unpause, pauser rotation,
+//!    and other privileged configuration.
+//! 2. Assign the pauser key to on-call automation or a monitoring service so
+//!    an incident can be halted within seconds.
+//! 3. Rotate the pauser key after any incident, or immediately if it may have
+//!    been compromised, via [`set_pauser`] (or [`clear_pauser`] to remove the
+//!    role entirely).
+//! 4. Because the pauser cannot unpause, a compromised pauser key can only
+//!    cause a denial of service that the cold admin key can recover from.
+//!
+//! A [`PauserChanged`] event is emitted whenever the pauser is set or cleared.
 #![no_std]
 
-use soroban_sdk::{contracttype, Env, String};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, String, Symbol};
+
+/// Topic symbol for the event emitted when the pauser role changes.
+pub const PAUSER_CHANGED: Symbol = symbol_short!("pauser");
+
+/// Event payload emitted by [`set_pauser`] and [`clear_pauser`].
+///
+/// `pauser` is `Some(address)` when the role is assigned and `None` when it is
+/// cleared.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauserChanged {
+    pub pauser: Option<Address>,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -90,6 +140,8 @@ enum DataKey {
     PauseUntil,
     /// Scopes currently paused independently of the global flag (#805).
     PausedScopes,
+    /// Optional hot key allowed to pause (but not unpause) the contract.
+    Pauser,
 }
 
 ///Feature-level pause scope (#805). A global pause overrides every scope.
@@ -241,12 +293,71 @@ pub fn pause_until_at(env: &Env) -> Option<u64> {
     env.storage().instance().get(&DataKey::PauseUntil)
 }
 
+/// Returns the configured pauser address, or `None` if no pauser role is set.
+pub fn get_pauser(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::Pauser)
+}
+
+/// Assign `pauser` as the hot key allowed to pause the contract.
+///
+/// **Admin-only**: the consuming contract must authenticate the admin before
+/// calling this helper. This crate does not know the admin `Address`, so it
+/// cannot enforce that check itself.
+///
+/// Emits a [`PauserChanged`] event. Overwrites any previously configured
+/// pauser.
+pub fn set_pauser(env: &Env, pauser: &Address) {
+    env.storage().instance().set(&DataKey::Pauser, pauser);
+    env.events().publish(
+        (PAUSER_CHANGED,),
+        PauserChanged {
+            pauser: Some(pauser.clone()),
+        },
+    );
+}
+
+/// Remove the pauser role, leaving only the admin able to pause.
+///
+/// **Admin-only**: the consuming contract must authenticate the admin before
+/// calling this helper.
+///
+/// Emits a [`PauserChanged`] event with `pauser: None`.
+pub fn clear_pauser(env: &Env) {
+    env.storage().instance().remove(&DataKey::Pauser);
+    env.events()
+        .publish((PAUSER_CHANGED,), PauserChanged { pauser: None });
+}
+
+/// Pause the contract if `caller` is the admin or the configured pauser.
+///
+/// The consuming contract must authenticate `caller` (e.g. via
+/// `caller.require_auth()`) before calling this helper. Returns `true` when
+/// the caller was authorized and the pause was applied, `false` otherwise.
+///
+/// Unpausing is intentionally **not** covered by this helper — [`unpause`]
+/// remains admin-only so a hot pauser key can never resume the contract.
+pub fn pause_authorized(env: &Env, caller: &Address, admin: &Address) -> bool {
+    let is_admin = caller == admin;
+    let is_pauser = match get_pauser(env) {
+        Some(pauser) => &pauser == caller,
+        None => false,
+    };
+    if is_admin || is_pauser {
+        pause(env);
+        true
+    } else {
+        false
+    }
+}
+
 /// Clear the paused flag, returning the contract to the active state.
 ///
 /// Also clears the stored pause timestamp and reason so they do not linger
 /// after the contract resumes.
 ///
 /// Calling this when not paused is a no-op — the flag remains cleared.
+///
+/// **Admin-only**: the pauser role cannot unpause.
 pub fn unpause(env: &Env) {
     env.storage().instance().set(&DataKey::Paused, &false);
     env.storage().instance().remove(&DataKey::PausedSince);
