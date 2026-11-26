@@ -207,7 +207,7 @@ pub struct Upgraded {
 /// discover it without polling storage.
 ///
 /// topics : [Symbol("proposal_created"), u64(id)]
-/// data   : { expiry: u32, payload_hash: BytesN<32> }
+/// data   : { expiry: u32, payload_hash: BytesN<32>, description_hash: Option<BytesN<32>> }
 #[contractevent]
 pub struct ProposalCreated {
     #[topic]
@@ -215,6 +215,8 @@ pub struct ProposalCreated {
     pub expiry: u32,
     /// SHA-256 of the proposal payload.
     pub payload_hash: BytesN<32>,
+    /// Optional hash of the human-readable proposal document (#803).
+    pub description_hash: Option<BytesN<32>>,
 }
 
 /// Emitted when `approve` records a signer's approval on a proposal.
@@ -256,6 +258,9 @@ fn extend_instance_ttl(env: &Env) {
 struct Proposal {
     /// The payload to execute (opaque bytes).
     pub payload: soroban_sdk::Bytes,
+    /// Optional hash of a human-readable proposal document so signers can
+    /// recognise what opaque `payload` bytes actually do (#803).
+    pub description_hash: Option<BytesN<32>>,
     /// Ledger sequence at which this proposal expires.
     pub expiry: u32,
     /// Addresses that have approved this proposal.
@@ -583,6 +588,18 @@ impl MultisigAdmin {
         payload: soroban_sdk::Bytes,
         expiry_ledger: u32,
     ) -> Result<u64, Error> {
+        Self::propose_with_description(env, payload, expiry_ledger, None)
+    }
+
+    /// Create a proposal carrying an optional hash of a human-readable
+    /// description, so signers reviewing opaque payload bytes in a wallet can
+    /// tell what they are approving (#803).
+    pub fn propose_with_description(
+        env: Env,
+        payload: soroban_sdk::Bytes,
+        expiry_ledger: u32,
+        description_hash: Option<BytesN<32>>,
+    ) -> Result<u64, Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         let current_ledger = env.ledger().sequence();
         if expiry_ledger <= current_ledger {
@@ -603,6 +620,7 @@ impl MultisigAdmin {
         let payload_hash: BytesN<32> = env.crypto().sha256(&payload).to_bytes();
         let proposal = Proposal {
             payload,
+            description_hash: description_hash.clone(),
             expiry: expiry_ledger,
             approvals: Vec::new(&env),
         };
@@ -622,6 +640,7 @@ impl MultisigAdmin {
             id: proposal_id,
             expiry: expiry_ledger,
             payload_hash,
+            description_hash,
         }
         .publish(&env);
 
@@ -830,13 +849,18 @@ impl MultisigAdmin {
     pub fn get_proposal(
         env: Env,
         proposal_id: u64,
-    ) -> Result<(soroban_sdk::Bytes, u32, Vec<Address>), Error> {
+    ) -> Result<(soroban_sdk::Bytes, u32, Vec<Address>, Option<BytesN<32>>), Error> {
         let proposal: Proposal = env
             .storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))
             .ok_or(Error::ProposalNotFound)?;
-        Ok((proposal.payload, proposal.expiry, proposal.approvals))
+        Ok((
+            proposal.payload,
+            proposal.expiry,
+            proposal.approvals,
+            proposal.description_hash,
+        ))
     }
 }
 
