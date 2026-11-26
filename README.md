@@ -170,3 +170,8 @@ See [SECURITY.md](./SECURITY.md) for how to report a vulnerability.
 ## License
 
 [MIT](./LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-787 -->
+- #787: compliance-aggregator: add check_transfer(from, to, amount)
