@@ -45,6 +45,23 @@ impl Harness {
         crate::pause_reason(&env)
     }
 
+    pub fn pause_scope(env: Env, scope: crate::PauseScope) {
+        crate::pause_scope(&env, scope);
+    }
+
+    pub fn unpause_scope(env: Env, scope: crate::PauseScope) {
+        crate::unpause_scope(&env, scope);
+    }
+
+    pub fn is_paused_scope(env: Env, scope: crate::PauseScope) -> bool {
+        crate::is_paused_scope(&env, scope)
+    }
+
+    pub fn check_not_paused_scope(env: Env, scope: crate::PauseScope) -> bool {
+        crate::require_not_paused_scope(&env, scope);
+        true
+    }
+
     /// Calls `require_not_paused` and returns `true` if the call succeeds
     /// (i.e. the contract is not paused). Used to verify the happy path
     /// without a separate entry point.
@@ -354,4 +371,56 @@ fn test_unpause_clears_expiry() {
     client.unpause();
     assert!(!client.is_paused());
     assert!(client.pause_until_at().is_none());
+}
+
+// ─── Issue #805: feature-scoped pauses ─────────────────────────────────────
+
+#[test]
+fn test_scoped_pause_isolates_other_features() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+    use crate::PauseScope;
+
+    assert!(!client.is_paused());
+    client.pause_scope(&PauseScope::Mint);
+    assert!(!client.is_paused());
+    assert!(client.is_paused_scope(&PauseScope::Mint));
+    assert!(!client.is_paused_scope(&PauseScope::Redeem));
+    assert!(client.check_not_paused_scope(&PauseScope::Redeem));
+}
+
+#[test]
+fn test_global_pause_overrides_every_scope() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+    use crate::PauseScope;
+
+    client.pause();
+    for scope in [
+        PauseScope::Mint,
+        PauseScope::Redeem,
+        PauseScope::Transfer,
+        PauseScope::Admin,
+    ] {
+        assert!(client.is_paused_scope(&scope));
+    }
+}
+
+#[test]
+fn test_unpause_scope_and_global_unpause() {
+    let env = Env::default();
+    let id = env.register(Harness, ());
+    let client = HarnessClient::new(&env, &id);
+    use crate::PauseScope;
+
+    client.pause_scope(&PauseScope::Mint);
+    client.pause_scope(&PauseScope::Redeem);
+    client.unpause_scope(&PauseScope::Mint);
+    assert!(!client.is_paused_scope(&PauseScope::Mint));
+    assert!(client.is_paused_scope(&PauseScope::Redeem));
+
+    client.unpause();
+    assert!(!client.is_paused_scope(&PauseScope::Redeem));
 }
