@@ -10,6 +10,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  migration-test:
+    name: previous-release WASM upgrade test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Upgrade previous release WASM to HEAD
+        run: bash scripts/test-migration.sh
+
   smoke-test:
     name: CLI smoke test (local network)
     runs-on: ubuntu-latest
@@ -227,8 +243,28 @@ jobs:
             echo "✓ docs/interfaces is up to date"
           else
             echo "✗ docs/interfaces is out of date. Run ./scripts/regenerate-docs.sh and commit the changes."
-            git status --porcelain docs/interfaces/
-            git diff docs/interfaces/
+          git status --porcelain docs/interfaces/
+          git diff docs/interfaces/
+          exit 1
+          fi
+
+  docs-errors:
+    name: docs/ERRORS.md up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate error code docs
+        run: python3 scripts/generate-errors-docs.py
+      - name: Check for differences
+        run: |
+          # `git status --porcelain` also catches the file never having been
+          # committed (e.g. after a fresh clone).
+          if [ -z "$(git status --porcelain docs/ERRORS.md)" ]; then
+            echo "✓ docs/ERRORS.md is up to date"
+          else
+            echo "✗ docs/ERRORS.md is out of date. Run python3 scripts/generate-errors-docs.py and commit the changes."
+            git status --porcelain docs/ERRORS.md
+            git diff docs/ERRORS.md
             exit 1
           fi
 

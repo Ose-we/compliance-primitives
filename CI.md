@@ -37,6 +37,9 @@ Runs `cargo-semver-checks check-release` against publishable crates to catch acc
 
 Examples in `examples/` are not checked: they are consumer demos, not libraries that others depend on.
 
+### docs/ERRORS.md up to date
+Runs `python3 scripts/generate-errors-docs.py` and fails if `docs/ERRORS.md` differs from the committed copy. Ensures the combined error code reference (generated from every `Error` enum in `contracts/` and `examples/`) stays in sync with the source. Locally: `make check-errors-docs`.
+
 ## Scheduled Jobs (.github/workflows/scheduled-deny.yml)
 
 ### Scheduled cargo-deny check (weekly)
