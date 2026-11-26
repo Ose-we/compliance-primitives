@@ -28,6 +28,7 @@ members = [
     "examples/rwa-compliance-flow",
     "examples/rwa-token",
     "examples/rwa-token-aggregator",
+    "examples/tokenized-fund",
 ]
 
 [workspace.package]
