@@ -816,6 +816,17 @@ impl JurisdictionFlag {
         Self::load_active_jurisdictions(&env, &address).iter().next()
     }
 
+    /// Returns the ledger through which `address`'s jurisdiction flag is valid
+    /// (inclusive), as set by [`set_jurisdiction_until`](Self::set_jurisdiction_until).
+    ///
+    /// Returns `None` if no expiry is set, which covers both flags that never
+    /// expire and addresses with no flag at all. The expiry is returned even
+    /// after it has passed, so integrators can compare it with the current
+    /// ledger to warn users before a flag lapses. Does not publish events.
+    pub fn get_jurisdiction_expiry(env: Env, address: Address) -> Option<u32> {
+        env.storage().persistent().get(&DataKey::ValidUntil(address))
+    }
+
     /// Returns whether `address` is permitted under `allowed_codes`.
     ///
     /// Each entry of `allowed_codes` is either an ISO 3166-1 alpha-2 code or

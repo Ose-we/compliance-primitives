@@ -1495,3 +1495,34 @@ fn block_list_mode_inverts_permission() {
     assert!(!client.is_permitted_jurisdiction(&blocked, &vec![&env, s(&env, "SANCTIONED")]));
     assert!(client.is_permitted_jurisdiction(&allowed, &vec![&env, s(&env, "SANCTIONED")]));
 }
+
+#[test]
+fn test_get_jurisdiction_expiry_returns_set_expiry() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let user = Address::generate(&env);
+    let code = String::from_str(&env, "US");
+    env.ledger()
+        .with_mut(|ledger| ledger.sequence_number = 10);
+
+    // No flag at all: no expiry.
+    assert_eq!(client.get_jurisdiction_expiry(&user), None);
+
+    client.set_jurisdiction_until(&issuer, &user, &code, &500);
+    assert_eq!(client.get_jurisdiction_expiry(&user), Some(500));
+
+    // Clearing the flag clears the expiry with it.
+    client.set_jurisdiction(&issuer, &user, &code);
+    assert_eq!(client.get_jurisdiction_expiry(&user), None);
+}
+
+#[test]
+fn test_get_jurisdiction_expiry_returns_none_for_unexpiring_flag() {
+    let env = Env::default();
+    let (issuer, _contract_id, client) = setup(&env);
+    let user = Address::generate(&env);
+    let code = String::from_str(&env, "GB");
+
+    client.set_jurisdiction(&issuer, &user, &code);
+    assert_eq!(client.get_jurisdiction_expiry(&user), None);
+}
