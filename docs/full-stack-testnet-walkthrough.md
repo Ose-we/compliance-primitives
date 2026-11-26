@@ -57,12 +57,10 @@ helper library — it has no `#[contract]` macro and produces no wasm
 exports of its own (see `contracts/pausable/src/lib.rs`), so there's
 nothing to deploy for it.
 
-`allowlist-token` is deployed and initialized but **not** wired into
-`compliance-aggregator` or `policy-engine`: both of those only support
-composing `denylist-gate` and `jurisdiction-flag` today (see
-`CheckKind` in `contracts/policy-engine/src/lib.rs` and the
-`Option<Address>` fields on `compliance-aggregator`'s `initialize`) — there
-is no generic "allowlist" check kind yet.
+In this walkthrough, `allowlist-token` is deployed and initialized but left
+unconfigured in `compliance-aggregator` and `policy-engine`. Both support
+allowlist checks: use `set_allowlist` on the aggregator or add an `Allowlist`
+check to the policy engine when the integration needs it.
 
 ## The `multisig-admin` demo
 

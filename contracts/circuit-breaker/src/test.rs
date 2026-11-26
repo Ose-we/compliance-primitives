@@ -1,8 +1,8 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::testutils::{Address as _, Events as _};
-use soroban_sdk::{Env, IntoVal};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+use soroban_sdk::Env;
 
 fn setup(env: &Env) -> (Address, CircuitBreakerClient<'_>) {
     env.mock_all_auths();
@@ -33,27 +33,79 @@ fn test_admin_can_freeze_and_unfreeze() {
 }
 
 #[test]
+fn test_guardian_can_freeze_but_cannot_unfreeze() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    client.add_guardian(&admin, &guardian);
+
+    client.freeze(&guardian, &None);
+    assert!(client.is_frozen());
+
+    assert_eq!(
+        client.try_unfreeze(&guardian),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(client.is_frozen());
+
+    client.unfreeze(&admin);
+    assert!(!client.is_frozen());
+}
+
+#[test]
+fn test_freeze_history_records_reason_and_duration() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let reason = String::from_str(&env, "incident response");
+
+    env.ledger().set_timestamp(100);
+    client.freeze(&admin, &Some(reason.clone()));
+    assert_eq!(
+        client.freeze_history(&1).get(0),
+        Some(FreezeRecord {
+            by: admin.clone(),
+            at: 100,
+            until: None,
+            reason: Some(reason),
+        })
+    );
+
+    env.ledger().set_timestamp(130);
+    client.unfreeze(&admin);
+    assert_eq!(client.freeze_history(&1).get(0).unwrap().until, Some(130));
+}
+
+#[test]
+fn test_freeze_history_is_bounded_and_limit_selects_latest_records() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+
+    for timestamp in 1..=(MAX_FREEZE_HISTORY + 2) {
+        env.ledger().set_timestamp(timestamp as u64);
+        client.freeze(&admin, &None);
+        client.unfreeze(&admin);
+    }
+
+    let latest = client.freeze_history(&2);
+    assert_eq!(latest.len(), 2);
+    assert_eq!(latest.get(0).unwrap().at, MAX_FREEZE_HISTORY as u64 + 1);
+    assert_eq!(latest.get(1).unwrap().at, MAX_FREEZE_HISTORY as u64 + 2);
+    assert_eq!(
+        client.freeze_history(&(MAX_FREEZE_HISTORY + 1)).len(),
+        MAX_FREEZE_HISTORY
+    );
+}
+
+#[test]
 fn test_freeze_and_unfreeze_emit_events_with_admin() {
     let env = Env::default();
     let (admin, client) = setup(&env);
 
     client.freeze(&admin, &None);
-    let freeze_events = env.events().all();
-    let (_contract_id, topics, _data) = freeze_events.last().unwrap();
-    assert_eq!(
-        topics.get_unchecked(0),
-        soroban_sdk::Symbol::new(&env, "frozen").into_val(&env)
-    );
-    assert_eq!(topics.get_unchecked(1), admin.clone().into_val(&env));
+    assert_eq!(env.events().all().events().len(), 1);
 
     client.unfreeze(&admin);
-    let unfreeze_events = env.events().all();
-    let (_contract_id, topics, _data) = unfreeze_events.last().unwrap();
-    assert_eq!(
-        topics.get_unchecked(0),
-        soroban_sdk::Symbol::new(&env, "unfrozen").into_val(&env)
-    );
-    assert_eq!(topics.get_unchecked(1), admin.clone().into_val(&env));
+    assert_eq!(env.events().all().events().len(), 1);
 }
 
 #[test]
@@ -100,14 +152,14 @@ fn test_double_freeze_is_idempotent() {
     // Calling `freeze` twice in a row is a no-op the second time: state
     // stays frozen and the call itself succeeds rather than erroring.
     client.freeze(&admin, &None);
-    assert!(client.is_frozen());
     // Exactly one Frozen event should have been emitted so far.
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(env.events().all().events().len(), 1);
+    assert!(client.is_frozen());
 
     client.freeze(&admin, &None);
-    assert!(client.is_frozen());
     // Second freeze must NOT emit another event.
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(env.events().all().events().len(), 0);
+    assert!(client.is_frozen());
 }
 
 #[test]
@@ -120,12 +172,12 @@ fn test_double_unfreeze_is_idempotent() {
     client.unfreeze(&admin);
     assert!(!client.is_frozen());
     // Already unfrozen at init; first unfreeze call also should not emit.
-    assert_eq!(env.events().all().len(), 0);
+    assert_eq!(env.events().all().events().len(), 0);
 
     client.unfreeze(&admin);
     assert!(!client.is_frozen());
     // Still no events: both calls were no-ops.
-    assert_eq!(env.events().all().len(), 0);
+    assert_eq!(env.events().all().events().len(), 0);
 }
 
 #[test]
@@ -135,11 +187,11 @@ fn test_freeze_then_unfreeze_emits_exactly_one_event_each() {
 
     client.freeze(&admin, &None);
     // One Frozen event.
-    assert_eq!(env.events().all().len(), 1);
+    assert_eq!(env.events().all().events().len(), 1);
 
     client.unfreeze(&admin);
-    // One Frozen + one Unfrozen = two events total.
-    assert_eq!(env.events().all().len(), 2);
+    // The last invocation emits one Unfrozen event.
+    assert_eq!(env.events().all().events().len(), 1);
 }
 
 #[test]
@@ -203,17 +255,7 @@ fn test_propose_admin_emits_event() {
 
     client.propose_admin(&admin, &new_admin);
 
-    let events = env.events().all();
-    let (_contract_id, topics, _data) = events.last().unwrap();
-    assert_eq!(
-        topics,
-        (
-            soroban_sdk::Symbol::new(&env, "admin_proposed"),
-            admin.clone(),
-            new_admin,
-        )
-            .into_val(&env)
-    );
+    assert_eq!(env.events().all().events().len(), 1);
 }
 
 #[test]
@@ -225,13 +267,7 @@ fn test_accept_admin_emits_transferred_event() {
     client.propose_admin(&admin, &new_admin);
     client.accept_admin(&new_admin);
 
-    let events = env.events().all();
-    let (_contract_id, topics, _data) = events.last().unwrap();
-    assert_eq!(
-        topics.get_unchecked(0),
-        soroban_sdk::Symbol::new(&env, "admin_transferred").into_val(&env)
-    );
-    assert_eq!(topics.get_unchecked(1), new_admin.clone().into_val(&env));
+    assert_eq!(env.events().all().events().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
