@@ -61,6 +61,7 @@
 //! - `DenylistCheck` — calls `denylist-gate.check(address) -> bool`
 //! - `JurisdictionCheck` — calls
 //!   `jurisdiction-flag.is_permitted_jurisdiction(address, allowed_codes) -> bool`
+//! - `AllowlistCheck` — calls `allowlist-token.is_allowed(address) -> bool`
 //! - `CircuitBreaker` — calls `circuit-breaker.is_frozen() -> bool`; the check
 //!   passes only while the breaker is not frozen. A frozen breaker denies
 //!   without consulting the other checks.
@@ -69,6 +70,11 @@
 //! All checks are optional; if a check type's contract address has not been
 //! registered the check is skipped (treated as passing). Registering at least
 //! one check is enforced at call time.
+//!
+//! The existing `check_address` and `check_all` entrypoints keep their return
+//! shapes. `check_address_verbose` and `check_all_verbose` additionally report
+//! the first failed source and its stable reason code for wallet-facing
+//! diagnostics.
 //!
 //! ## Choosing `check_address` vs. `check_all`
 //!
@@ -83,7 +89,8 @@
 //! | Downstream primitive calls | Up to 4 × N | 1 breaker call + up to 3 × N |
 //! | Return payload | N × `(bool, Vec<CheckResult>)` | 1 × `Vec<AddressCheckResult>` (also carries each `Address`) |
 //!
-//! The recorded `check_address` baseline (both checks registered, no breaker)
+//! The recorded `check_address` baseline (denylist and jurisdiction checks,
+//! no breaker or allowlist)
 //! is a ceiling of **~1.5M CPU instructions / ~400 KB memory** per call
 //! (`[compliance-aggregator.check_address]` in `budget-baselines.toml`).
 //! Almost all of that is the downstream calls, so the cost model is:
@@ -205,10 +212,10 @@ pub trait AllowlistTokenInterface {
 ///
 /// Extend the instance TTL when its remaining TTL drops below this many
 /// ledgers (~7 days at ~5s/ledger on mainnet).
-pub(crate) const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+pub(crate) const INSTANCE_TTL_THRESHOLD: u32 = compliance_ttl::TTL_THRESHOLD; // ~7 days
 
 /// Target remaining instance TTL after extension (~90 days at ~5s/ledger).
-pub(crate) const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+pub(crate) const INSTANCE_TTL_EXTEND_TO: u32 = compliance_ttl::TTL_EXTEND_TO; // ~90 days
 
 /// Bump the contract instance TTL (and therefore every instance-storage
 /// entry) according to the policy documented above. Called from every
@@ -335,6 +342,22 @@ pub struct JurisdictionFlagSet {
     pub flag: Address,
 }
 
+/// Emitted when `clear_denylist_gate` unregisters the denylist-gate check.
+/// `previous` is the address that was registered before the clear.
+#[contractevent]
+pub struct DenylistGateCleared {
+    #[topic]
+    pub previous: Address,
+}
+
+/// Emitted when `clear_jurisdiction_flag` unregisters the jurisdiction check.
+/// `previous` is the address that was registered before the clear.
+#[contractevent]
+pub struct JurisdictionFlagCleared {
+    #[topic]
+    pub previous: Address,
+}
+
 #[contractevent]
 pub struct CircuitBreakerSet {
     #[topic]
@@ -384,7 +407,7 @@ pub struct ComplianceAggregator;
 impl ComplianceAggregator {
     /// Maximum number of addresses accepted by `batch_check` in a single
     /// call. Bounds the per-transaction cross-contract call fan-out (each
-    /// address costs up to two nested calls) so a single invocation cannot
+    /// address costs up to three nested calls) so a single invocation cannot
     /// exceed the host's resource budget. Set to 45 to fit comfortably within
     /// Soroban's default per-invocation resource limits.
     pub const MAX_BATCH_SIZE: u32 = 45;
@@ -500,7 +523,14 @@ impl ComplianceAggregator {
     pub fn clear_denylist_gate(env: Env, admin: Address) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().remove(&DataKey::DenylistGate);
+        if let Some(previous) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::DenylistGate)
+        {
+            env.storage().instance().remove(&DataKey::DenylistGate);
+            DenylistGateCleared { previous }.publish(&env);
+        }
         extend_instance_ttl(&env);
         Ok(())
     }
@@ -510,7 +540,14 @@ impl ComplianceAggregator {
     pub fn clear_jurisdiction_flag(env: Env, admin: Address) -> Result<(), Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().remove(&DataKey::JurisdictionFlag);
+        if let Some(previous) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::JurisdictionFlag)
+        {
+            env.storage().instance().remove(&DataKey::JurisdictionFlag);
+            JurisdictionFlagCleared { previous }.publish(&env);
+        }
         extend_instance_ttl(&env);
         Ok(())
     }
@@ -532,6 +569,27 @@ impl ComplianceAggregator {
         env.storage().instance().set(&DataKey::CircuitBreaker, &breaker);
         extend_instance_ttl(&env);
         CircuitBreakerSet { breaker }.publish(&env);
+        Ok(())
+    }
+
+    /// Register or replace the `allowlist-token` contract address. Admin-only.
+    pub fn set_allowlist(env: Env, admin: Address, allowlist: Address) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistToken, &allowlist);
+        extend_instance_ttl(&env);
+        AllowlistTokenSet { allowlist }.publish(&env);
+        Ok(())
+    }
+
+    /// Unregister the `allowlist-token` check. Admin-only.
+    pub fn clear_allowlist(env: Env, admin: Address) -> Result<(), Error> {
+        compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().remove(&DataKey::AllowlistToken);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -697,6 +755,21 @@ impl ComplianceAggregator {
             results.push_back(Self::check_result(CheckKind::Allowlist, passed));
         }
 
+        // -- allowlist-token check --
+        if let Some(allowlist_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AllowlistToken)
+        {
+            let client = AllowlistTokenClient::new(&env, &allowlist_addr);
+            let passed = client.is_allowed(&address);
+            all_passed = all_passed && passed;
+            results.push_back(CheckResult {
+                check: CheckKind::Allowlist,
+                passed,
+            });
+        }
+
         if results.is_empty() {
             return Err(Error::NoChecksRegistered);
         }
@@ -784,6 +857,16 @@ impl ComplianceAggregator {
                     all_passed = all_passed && passed;
                     results.push_back(Self::check_result(CheckKind::Allowlist, passed));
                 }
+
+                if let Some(ref aa) = allowlist_addr {
+                    let client = AllowlistTokenClient::new(&env, aa);
+                    let passed = client.is_allowed(&address);
+                    all_passed = all_passed && passed;
+                    results.push_back(CheckResult {
+                        check: CheckKind::Allowlist,
+                        passed,
+                    });
+                }
             }
 
             batch.push_back(AddressCheckResult { address, all_passed, checks: results });
@@ -817,8 +900,8 @@ impl ComplianceAggregator {
     /// per-check breakdown that `check_all` provides.
     ///
     /// `allowed_jurisdictions` is forwarded to the `jurisdiction-flag` check
-    /// exactly as in `check_address`/`check_all`, so a registered jurisdiction
-    /// check is still fully evaluated here (it is not skipped).
+    /// exactly as in `check_address`/`check_all`. All configured sources,
+    /// including the circuit breaker and allowlist, are applied.
     ///
     /// Guards against unbounded batches (and the associated cross-contract
     /// call fan-out) with `MAX_BATCH_SIZE`. Returns
@@ -889,6 +972,44 @@ impl ComplianceAggregator {
             return Err(Error::NotAuthorized);
         }
         Ok(())
+    }
+
+    fn failure_for_checks(checks: &Vec<CheckResult>) -> Option<CheckFailure> {
+        for check in checks.iter() {
+            if !check.passed {
+                let code = match check.check {
+                    CheckKind::Denylist => CheckFailureCode::Denylisted,
+                    CheckKind::Jurisdiction => CheckFailureCode::JurisdictionNotPermitted,
+                    CheckKind::CircuitBreaker => CheckFailureCode::CircuitBreakerFrozen,
+                    CheckKind::Allowlist => CheckFailureCode::NotAllowlisted,
+                };
+                return Some(CheckFailure {
+                    source: check.check,
+                    code,
+                });
+            }
+        }
+        None
+    }
+
+    fn check_kind_symbol(env: &Env, source: CheckKind) -> Symbol {
+        match source {
+            CheckKind::Denylist => Symbol::new(env, "Denylist"),
+            CheckKind::Jurisdiction => Symbol::new(env, "Jurisdiction"),
+            CheckKind::CircuitBreaker => Symbol::new(env, "CircuitBreaker"),
+            CheckKind::Allowlist => Symbol::new(env, "Allowlist"),
+        }
+    }
+
+    fn check_failure_code_symbol(env: &Env, code: CheckFailureCode) -> Symbol {
+        match code {
+            CheckFailureCode::Denylisted => Symbol::new(env, "Denylisted"),
+            CheckFailureCode::JurisdictionNotPermitted => {
+                Symbol::new(env, "JurisdictionNotPermitted")
+            }
+            CheckFailureCode::CircuitBreakerFrozen => Symbol::new(env, "CircuitBreakerFrozen"),
+            CheckFailureCode::NotAllowlisted => Symbol::new(env, "NotAllowlisted"),
+        }
     }
 }
 

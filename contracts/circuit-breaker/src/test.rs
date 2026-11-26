@@ -45,9 +45,14 @@ fn test_admin_can_freeze_and_unfreeze() {
 }
 
 #[test]
-fn test_freeze_and_unfreeze_emit_events_with_admin() {
+fn test_guardian_can_freeze_but_cannot_unfreeze() {
     let env = Env::default();
     let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    client.add_guardian(&admin, &guardian);
+
+    client.freeze(&guardian, &None);
+    assert!(client.is_frozen());
 
     client.freeze(&admin, &None);
     let topics = event_topics(&env, 0);
@@ -433,6 +438,132 @@ fn assert_budget_within_threshold(measured: (u64, u64), baseline: (u64, u64), la
     );
 }
 
+// ---------------------------------------------------------------------------
+// Fuzz target: guardian management — #817
+//
+// Random add/remove/freeze/unfreeze sequences by random callers. Invariants:
+//   * only the admin (or a guardian, for freeze) can freeze/unfreeze;
+//   * the guardian list never contains duplicates.
+//
+// The harness is bounded so it can run in CI. Iteration and per-iteration
+// operation counts are configurable via `FUZZ_ITERATIONS` / `FUZZ_OPS`.
+// ---------------------------------------------------------------------------
+
+fn fuzz_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// Deterministic xorshift64* PRNG so failures are reproducible.
+struct FuzzRng(u64);
+
+impl FuzzRng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        if bound == 0 {
+            0
+        } else {
+            self.next_u64() % bound
+        }
+    }
+}
+
+fn fuzz_guardian_sequences(seed: u64, iterations: u64, ops: u64) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(CircuitBreaker, ());
+    let client = CircuitBreakerClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // A small pool of actors keeps collisions (and thus duplicate-add paths)
+    // likely without exhausting the test environment.
+    let mut actors: std::vec::Vec<Address> = std::vec::Vec::new();
+    for _ in 0..4 {
+        actors.push(Address::generate(&env));
+    }
+
+    let mut rng = FuzzRng::new(seed);
+
+    for _ in 0..iterations {
+        for _ in 0..ops {
+            let caller = actors[rng.below(actors.len() as u64) as usize].clone();
+            let target = actors[rng.below(actors.len() as u64) as usize].clone();
+            let is_admin = caller == admin;
+
+            match rng.below(4) {
+                0 => {
+                    // add_guardian: only admin may add.
+                    let result = client.try_add_guardian(&caller, &target);
+                    if !is_admin {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+                1 => {
+                    // remove_guardian: only admin may remove.
+                    let result = client.try_remove_guardian(&caller, &target);
+                    if !is_admin {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+                2 => {
+                    // freeze: admin or a current guardian may freeze.
+                    let allowed = is_admin || client.is_guardian(&caller);
+                    let result = client.try_freeze(&caller, &None);
+                    if allowed {
+                        assert!(result.is_ok(), "authorized freeze must succeed");
+                    } else {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+                _ => {
+                    // unfreeze: admin or a current guardian may unfreeze.
+                    let allowed = is_admin || client.is_guardian(&caller);
+                    let result = client.try_unfreeze(&caller);
+                    if allowed {
+                        assert!(result.is_ok(), "authorized unfreeze must succeed");
+                    } else {
+                        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+                    }
+                }
+            }
+
+            // Invariant: the guardian list has no duplicates.
+            let guardians = client.get_guardians();
+            let mut seen: std::vec::Vec<Address> = std::vec::Vec::new();
+            for g in guardians.iter() {
+                assert!(
+                    !seen.contains(&g),
+                    "duplicate guardian detected in list"
+                );
+                seen.push(g);
+            }
+        }
+    }
+}
+
+#[test]
+fn fuzz_guardian_management() {
+    let iterations = fuzz_env_u64("FUZZ_ITERATIONS", 32);
+    let ops = fuzz_env_u64("FUZZ_OPS", 16);
+    fuzz_guardian_sequences(0x9E37_79B9_7F4A_7C15, iterations, ops);
+}
+
 #[test]
 fn test_budget_regression_is_frozen() {
     let env = Env::default();
@@ -447,4 +578,177 @@ fn test_budget_regression_is_frozen() {
 
     let baseline = read_baseline(&baseline_path(), "circuit-breaker.is_frozen");
     assert_budget_within_threshold(measured, baseline, "circuit-breaker is_frozen");
+}
+
+#[test]
+fn test_add_and_remove_guardian_emit_events() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+
+    client.add_guardian(&admin, &guardian);
+    let added = env.events().all();
+    let (_contract_id, topics, _data) = added.last().unwrap();
+    assert_eq!(
+        topics.get_unchecked(0),
+        soroban_sdk::Symbol::new(&env, "guardian_added").into_val(&env)
+    );
+    assert_eq!(topics.get_unchecked(1), admin.clone().into_val(&env));
+
+    // Adding an existing guardian must NOT emit another event.
+    let count = env.events().all().len();
+    client.add_guardian(&admin, &guardian);
+    assert_eq!(env.events().all().len(), count);
+
+    client.remove_guardian(&admin, &guardian);
+    let removed = env.events().all();
+    let (_contract_id, topics, _data) = removed.last().unwrap();
+    assert_eq!(
+        topics.get_unchecked(0),
+        soroban_sdk::Symbol::new(&env, "guardian_removed").into_val(&env)
+    );
+    assert_eq!(topics.get_unchecked(1), admin.clone().into_val(&env));
+
+    // Removing a non-guardian must NOT emit another event.
+    let count = env.events().all().len();
+    client.remove_guardian(&admin, &guardian);
+    assert_eq!(env.events().all().len(), count);
+}
+
+// ---- #778 timed freezes ----
+
+#[test]
+fn test_freeze_for_expires_automatically() {
+    use soroban_sdk::testutils::Ledger as _;
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    client.add_guardian(&admin, &guardian);
+    let start = env.ledger().sequence();
+    let until = client.freeze_for(&guardian, &100);
+    assert_eq!(until, start + 100);
+    assert!(client.is_frozen());
+    env.ledger().set_sequence_number(start + 99);
+    assert!(client.is_frozen());
+    env.ledger().set_sequence_number(start + 100);
+    assert!(!client.is_frozen());
+}
+
+#[test]
+fn test_freeze_for_emits_event_and_never_shortens() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let start = env.ledger().sequence();
+    client.freeze_for(&admin, &500);
+    assert!(!env.events().all().is_empty());
+    let until = client.freeze_for(&admin, &10);
+    assert_eq!(until, start + 500);
+}
+
+#[test]
+fn test_unfreeze_clears_timed_freeze() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    client.freeze_for(&admin, &1_000);
+    client.unfreeze(&admin);
+    assert!(!client.is_frozen());
+}
+
+#[test]
+fn test_freeze_for_rejects_outsider() {
+    let env = Env::default();
+    let (_admin, client) = setup(&env);
+    let outsider = Address::generate(&env);
+    assert_eq!(
+        client.try_freeze_for(&outsider, &10),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+// ---- #779 scoped freezes ----
+
+#[test]
+fn test_freeze_scope_only_affects_that_scope() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let mint = Symbol::new(&env, "mint");
+    let transfer = Symbol::new(&env, "transfer");
+    client.freeze_scope(&admin, &mint);
+    assert!(client.is_frozen_scope(&mint));
+    assert!(!client.is_frozen_scope(&transfer));
+    assert!(!client.is_frozen());
+    client.unfreeze_scope(&admin, &mint);
+    assert!(!client.is_frozen_scope(&mint));
+}
+
+#[test]
+fn test_global_freeze_overrides_scopes() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let transfer = Symbol::new(&env, "transfer");
+    client.freeze(&admin);
+    assert!(client.is_frozen_scope(&transfer));
+    client.unfreeze(&admin);
+    client.freeze_for(&admin, &50);
+    assert!(client.is_frozen_scope(&transfer));
+}
+
+#[test]
+fn test_guardian_cannot_unfreeze_scope() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let guardian = Address::generate(&env);
+    client.add_guardian(&admin, &guardian);
+    let mint = Symbol::new(&env, "mint");
+    client.freeze_scope(&guardian, &mint);
+    assert_eq!(
+        client.try_unfreeze_scope(&guardian, &mint),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+// ---- #780 list_guardians ----
+
+#[test]
+fn test_list_guardians() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    assert_eq!(client.list_guardians().len(), 0);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.add_guardian(&admin, &g1);
+    client.add_guardian(&admin, &g2);
+    let list = client.list_guardians();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap(), g1);
+    assert_eq!(list.get(1).unwrap(), g2);
+    client.remove_guardian(&admin, &g1);
+    assert_eq!(client.list_guardians().len(), 1);
+}
+
+// ---- #781 MAX_GUARDIANS ----
+
+#[test]
+fn test_add_guardian_enforces_max() {
+    let env = Env::default();
+    let (admin, client) = setup(&env);
+    let mut first = None;
+    for _ in 0..MAX_GUARDIANS {
+        let g = Address::generate(&env);
+        if first.is_none() {
+            first = Some(g.clone());
+        }
+        client.add_guardian(&admin, &g);
+    }
+    let extra = Address::generate(&env);
+    assert_eq!(
+        client.try_add_guardian(&admin, &extra),
+        Err(Ok(Error::TooManyGuardians))
+    );
+    // Re-adding an existing guardian at the cap is still a no-op.
+    client.add_guardian(&admin, &first.clone().unwrap());
+    // Freeing a slot allows a new guardian.
+    client.remove_guardian(&admin, &first.unwrap());
+    client.add_guardian(&admin, &extra);
+    assert_eq!(client.list_guardians().len(), MAX_GUARDIANS);
 }
