@@ -202,6 +202,14 @@ impl CircuitBreaker {
 
     /// Freeze the breaker. Callable by the admin or any configured guardian,
     /// so an incident can be halted even when the admin key is unavailable.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `breaker` is a `CircuitBreakerClient`; a guardian halts flows during an incident.
+    /// breaker.freeze(&guardian);
+    /// assert!(breaker.is_frozen());
+    /// ```
     pub fn freeze(env: Env, caller: Address) -> Result<(), Error> {
         Self::require_admin_or_guardian(&env, &caller)?;
         env.storage().instance().set(&DataKey::Frozen, &true);

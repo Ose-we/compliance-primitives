@@ -431,6 +431,13 @@ impl JurisdictionFlag {
     ///
     /// Auth: gated by [`require_compliance_authority`] — allows either the issuer or a
     /// delegated compliance officer, so routine flag management does not require the issuer key.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `flag` is a `JurisdictionFlagClient`; tag `holder` with an ISO 3166-1 alpha-2 code.
+    /// flag.set_jurisdiction(&issuer, &holder, &String::from_str(&env, "DE"));
+    /// ```
     pub fn set_jurisdiction(
         env: Env,
         issuer: Address,

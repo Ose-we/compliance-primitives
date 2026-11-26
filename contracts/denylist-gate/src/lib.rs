@@ -776,6 +776,15 @@ impl DenylistGate {
     /// cross-contract invocation before proceeding with a transfer.
     ///
     /// **Not** affected by pause state — reads always succeed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `gate` is a `DenylistGateClient` for the deployed contract.
+    /// if !gate.check(&recipient) {
+    ///     panic!("recipient is denylisted");
+    /// }
+    /// ```
     pub fn check(env: Env, address: Address) -> bool {
         Self::extend_instance_ttl(&env);
         !Self::is_denied(&env, &address)

@@ -72,6 +72,15 @@ use soroban_sdk::{Address, Env};
 pub trait ComplianceCheck {
     /// Returns `true` if `address` passes this compliance check, `false`
     /// otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Generic helper that works with any implementing contract.
+    /// fn all_pass<C: ComplianceCheck>(env: &Env, address: &Address) -> bool {
+    ///     C::is_compliant(env, address.clone())
+    /// }
+    /// ```
     fn is_compliant(env: &Env, address: Address) -> bool;
 
     /// Returns `true` if `address` passes this compliance check for a transfer

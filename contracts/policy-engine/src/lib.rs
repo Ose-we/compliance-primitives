@@ -854,6 +854,15 @@ impl PolicyEngine {
     /// A `PolicyResult` event is always emitted so the outcome is auditable
     /// on-chain regardless of the result. `Err` is returned only for
     /// configuration failures (e.g. the contract was never initialized).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `engine` is a `PolicyEngineClient`; block the transfer if the policy fails.
+    /// if !engine.evaluate(&from, &to) {
+    ///     panic!("transfer blocked by policy");
+    /// }
+    /// ```
     pub fn evaluate(env: Env, from: Address, to: Address) -> Result<bool, Error> {
         let name = Self::default_policy_name(&env)?;
         let policy = Self::load_policy(&env, &name)?;

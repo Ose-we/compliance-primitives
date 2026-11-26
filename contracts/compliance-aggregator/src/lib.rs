@@ -619,6 +619,14 @@ impl ComplianceAggregator {
     /// Panics with `Error::NoChecksRegistered` if neither gate nor flag
     /// has been configured — calling an aggregator with zero checks is almost
     /// certainly a misconfiguration.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // `aggregator` is a `ComplianceAggregatorClient` for the deployed contract.
+    /// let allowed = soroban_sdk::vec![&env, String::from_str(&env, "US")];
+    /// let (all_passed, checks) = aggregator.check_address(&holder, &allowed);
+    /// ```
     pub fn check_address(
         env: Env,
         address: Address,
